@@ -1564,12 +1564,19 @@ export default function ProductionPage() {
               })}
             </div>
 
+            {/* The alloy spec only. The stock figure sits on the input below,
+                where the decision about how much to charge is actually made -
+                saying it twice just competes with itself. */}
             <p className="mb-3 text-sm text-[var(--muted-foreground)]">
-              {selectedGrade.description} ·{" "}
-              <span className="font-medium text-[var(--foreground)]">
-                {formatWeight(selectedGradeStock)}
-              </span>{" "}
-              in stock
+              {selectedGrade.description}
+              {stockLoadFailed && (
+                <>
+                  {" \u00b7 "}
+                  <span className="text-[var(--error)]">
+                    stock levels unavailable
+                  </span>
+                </>
+              )}
             </p>
 
             <Input
@@ -1585,9 +1592,18 @@ export default function ProductionPage() {
                   : undefined
               }
               helperText={
-                stockKnown && ingotChargeTotal > selectedGradeStock
+                // What is available, and - once a weight is typed - what would
+                // be left. The operator is deciding how much to charge, and
+                // that decision is about the remainder, not the total.
+                !stockKnown
+                  ? "Weight of ingot charged into this heat"
+                  : ingotChargeTotal > selectedGradeStock
                   ? undefined
-                  : "Weight of ingot charged into this heat"
+                  : ingotChargeTotal > 0
+                  ? `${formatWeight(selectedGradeStock)} available · ${formatWeight(
+                      selectedGradeStock - ingotChargeTotal
+                    )} left after this heat`
+                  : `${formatWeight(selectedGradeStock)} of ${selectedGrade.grade} available`
               }
               onChange={(e) =>
                 setFormData({ ...formData, aluminumUsed: e.target.value })
