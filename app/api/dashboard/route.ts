@@ -8,6 +8,7 @@ import {
   type MaterialForm,
 } from "@/lib/ingot";
 import prisma from "@/lib/prisma";
+import { getSettings } from "@/lib/settings";
 import { getSession } from "@/lib/auth";
 
 // GET - Dashboard statistics
@@ -116,9 +117,16 @@ export async function GET() {
       },
     });
 
-    // Low stock alerts (threshold: 10kg = 10000g)
-    const lowStockThreshold = 10000;
-    const lowStockItems = inventory.filter((inv) => inv.quantity < lowStockThreshold);
+    // Low stock alerts. The threshold is set in Settings > System rather than
+    // fixed here, so a foundry can pitch it at its own reorder point.
+    const { lowStockThreshold } = await getSettings();
+
+    // A line that has never held anything is not "running low" - it is a grade
+    // this plant does not stock. Flagging all of them buries the one line that
+    // genuinely dropped, which is the whole point of the alert.
+    const lowStockItems = inventory.filter(
+      (inv) => inv.quantity > 0 && inv.quantity < lowStockThreshold
+    );
 
     // Calculate total aluminum (all types)
     const totalAluminum = inventory.reduce((sum, inv) => sum + inv.quantity, 0);

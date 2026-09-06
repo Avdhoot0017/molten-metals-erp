@@ -11,6 +11,7 @@ import {
   Eye,
   EyeOff,
   Check,
+  AlertTriangle,
   X,
   Plus,
   Trash2,
@@ -79,6 +80,8 @@ export default function SettingsPage() {
   const [activityBusy, setActivityBusy] = React.useState(false);
   const [isLoading, setIsLoading] = React.useState(false);
   const [saveSuccess, setSaveSuccess] = React.useState(false);
+  // A failed save has to say so - the old stub always reported success
+  const [saveError, setSaveError] = React.useState<string | null>(null);
 
   // Profile state
   const [profileData, setProfileData] = React.useState({
@@ -137,13 +140,88 @@ export default function SettingsPage() {
     { id: "users" as TabType, label: "Users", icon: Users },
   ];
 
-  const handleSave = async () => {
-    setIsLoading(true);
-    // Simulate API call
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+  /** Shared tail of every save: report the outcome the same way. */
+  const finishSave = (error: string | null) => {
     setIsLoading(false);
-    setSaveSuccess(true);
-    setTimeout(() => setSaveSuccess(false), 3000);
+    setSaveError(error);
+    if (!error) {
+      setSaveSuccess(true);
+      setTimeout(() => setSaveSuccess(false), 3000);
+    }
+  };
+
+  /** Profile tab - the signed-in user's own details. */
+  const handleSaveProfile = async () => {
+    setIsLoading(true);
+    setSaveError(null);
+    try {
+      const res = await fetch("/api/profile", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: profileData.name,
+          email: profileData.email,
+          phone: profileData.phone,
+          designation: profileData.designation,
+        }),
+      });
+      const result = await res.json();
+      finishSave(result.success ? null : result.error || "Failed to save profile");
+    } catch {
+      finishSave("Failed to save profile");
+    }
+  };
+
+  /** Security tab - change your own password. */
+  const handleSavePassword = async () => {
+    if (passwordData.newPassword !== passwordData.confirmPassword) {
+      setSaveError("The new passwords do not match");
+      return;
+    }
+    if (!passwordData.currentPassword || !passwordData.newPassword) {
+      setSaveError("Enter your current password and the new one");
+      return;
+    }
+
+    setIsLoading(true);
+    setSaveError(null);
+    try {
+      const res = await fetch("/api/profile/password", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(passwordData),
+      });
+      const result = await res.json();
+      if (result.success) {
+        // Clearing the boxes is the visible sign it actually went through
+        setPasswordData({
+          currentPassword: "",
+          newPassword: "",
+          confirmPassword: "",
+        });
+      }
+      finishSave(result.success ? null : result.error || "Failed to change password");
+    } catch {
+      finishSave("Failed to change password");
+    }
+  };
+
+  /** System tab - plant-wide settings. */
+  const handleSaveSystem = async () => {
+    setIsLoading(true);
+    setSaveError(null);
+    try {
+      const res = await fetch("/api/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(systemSettings),
+      });
+      const result = await res.json();
+      if (result.success) setSystemSettings(result.data);
+      finishSave(result.success ? null : result.error || "Failed to save settings");
+    } catch {
+      finishSave("Failed to save settings");
+    }
   };
 
   const handleAddUser = () => {
@@ -191,6 +269,33 @@ export default function SettingsPage() {
       await loadUsers();
     })();
   }, [loadUsers]);
+
+  // The form used to open on hard-coded placeholder values, which read as
+  // real settings. Load what is actually stored.
+  React.useEffect(() => {
+    void (async () => {
+      try {
+        const [settingsRes, profileRes] = await Promise.all([
+          fetch("/api/settings"),
+          fetch("/api/profile"),
+        ]);
+        const settings = await settingsRes.json();
+        const profile = await profileRes.json();
+        if (settings.success) setSystemSettings(settings.data);
+        if (profile.success) {
+          setProfileData({
+            name: profile.data.name ?? "",
+            email: profile.data.email ?? "",
+            phone: profile.data.phone ?? "",
+            designation: profile.data.designation ?? "",
+          });
+        }
+      } catch {
+        // Leaving the defaults visible is better than an empty form; a save
+        // will report its own failure
+      }
+    })();
+  }, []);
 
   const handleSaveUser = async () => {
     setUserBusy(true);
@@ -320,7 +425,7 @@ export default function SettingsPage() {
       </div>
 
       <div className="pt-4 border-t border-[var(--border)]">
-        <Button onClick={handleSave} isLoading={isLoading}>
+        <Button onClick={handleSaveProfile} isLoading={isLoading}>
           <Save className="h-4 w-4 mr-2" />
           Save Changes
         </Button>
@@ -473,7 +578,7 @@ export default function SettingsPage() {
       </div>
 
       <div className="pt-4 border-t border-[var(--border)]">
-        <Button onClick={handleSave} isLoading={isLoading}>
+        <Button onClick={handleSavePassword} isLoading={isLoading}>
           <Save className="h-4 w-4 mr-2" />
           Update Password
         </Button>
@@ -620,7 +725,7 @@ export default function SettingsPage() {
       </div>
 
       <div className="pt-4 border-t border-[var(--border)]">
-        <Button onClick={handleSave} isLoading={isLoading}>
+        <Button onClick={handleSaveSystem} isLoading={isLoading}>
           <Save className="h-4 w-4 mr-2" />
           Save Settings
         </Button>
@@ -1328,12 +1433,17 @@ export default function SettingsPage() {
             Manage your account and system preferences
           </p>
         </div>
-        {saveSuccess && (
+        {saveError ? (
+          <div className="flex items-center gap-2 rounded-lg bg-red-50 px-4 py-2 text-[var(--error)]">
+            <AlertTriangle className="h-4 w-4 shrink-0" />
+            <span>{saveError}</span>
+          </div>
+        ) : saveSuccess ? (
           <div className="flex items-center gap-2 px-4 py-2 bg-[var(--success-light)] text-[var(--success)] rounded-lg">
             <Check className="h-4 w-4" />
             <span>Changes saved successfully</span>
           </div>
-        )}
+        ) : null}
       </div>
 
       <div className="flex flex-col lg:flex-row gap-6">

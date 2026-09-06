@@ -23,6 +23,10 @@ model User {
   email     String   @unique
   password  String
   name      String
+  // Shown on the profile page. Optional - they are contact details, not
+  // something a login should depend on.
+  phone       String?
+  designation String?
   role      UserRole @default(PRODUCTION_MANAGER)
   isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
@@ -165,6 +169,20 @@ model FettlingActivity {
   @@index([date])
   @@index([activityTypeId])
   @@map("fettling_activities")
+}
+
+// Plant-wide settings, edited in Settings > System.
+//
+// A key-value table rather than a column per setting: these are a handful of
+// small strings read occasionally, and a new one should not need a migration.
+// lib/settings.ts gives them types and defaults, so nothing else deals in raw
+// strings.
+model AppSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+
+  @@map("app_settings")
 }
 
 // Aluminum inventory types enum

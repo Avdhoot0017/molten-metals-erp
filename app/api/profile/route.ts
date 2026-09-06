@@ -14,6 +14,8 @@ const PROFILE_FIELDS = {
   id: true,
   email: true,
   name: true,
+  phone: true,
+  designation: true,
   role: true,
   isActive: true,
   createdAt: true,
@@ -57,7 +59,7 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const { name, email } = await request.json();
+    const { name, email, phone, designation } = await request.json();
 
     if (name !== undefined && !name.trim()) {
       return NextResponse.json({ error: "Name cannot be empty" }, { status: 400 });
@@ -85,6 +87,11 @@ export async function PUT(request: NextRequest) {
       data: {
         ...(name !== undefined ? { name: name.trim() } : {}),
         ...(email !== undefined ? { email: email.trim().toLowerCase() } : {}),
+        // Blank clears the field rather than storing an empty string
+        ...(phone !== undefined ? { phone: String(phone).trim() || null } : {}),
+        ...(designation !== undefined
+          ? { designation: String(designation).trim() || null }
+          : {}),
       },
       select: PROFILE_FIELDS,
     });
