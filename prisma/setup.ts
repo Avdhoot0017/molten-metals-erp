@@ -1,10 +1,10 @@
 /**
  * First-run master data.
  *
- * This is the reference data the ERP needs before anyone can use it: an
- * administrator to sign in as, the fettling operations the shop runs, the
- * furnaces, and an inventory line per material so stock can be booked against
- * it. Nothing else.
+ * This is the reference data the ERP needs before anyone can use it: one
+ * account per role, the fettling operations the shop runs, the furnaces, and
+ * an inventory line per material so stock can be booked against it. Nothing
+ * else.
  *
  * Deliberately NOT here: parts, suppliers, companies, employees, purchase
  * orders, production batches, stock quantities. Those are the foundry's own
@@ -32,7 +32,7 @@ import "dotenv/config";
 const connectionString = process.env.DATABASE_URL;
 if (!connectionString) {
   console.error(
-    "\n\u274c DATABASE_URL is not set.\n\n" +
+    "\n❌ DATABASE_URL is not set.\n\n" +
       "   Copy .env.example to .env and point DATABASE_URL at your\n" +
       "   PostgreSQL database before running setup.\n"
   );
@@ -56,6 +56,54 @@ const ACTIVITY_TYPES = [
 const FURNACES = ["Furnace 1", "Furnace 2"];
 
 /**
+ * One account per role, so every part of the plant can sign in on day one.
+ *
+ * Each is overridable from the environment - a real foundry wants its own
+ * addresses rather than @moltenmetals.com - and each gets its own generated
+ * password when none is supplied. Further accounts are added in Settings.
+ */
+interface RoleAccount {
+  /** Prefix for the <KEY>_EMAIL / <KEY>_NAME / <KEY>_PASSWORD env vars. */
+  envKey: string;
+  role: "ADMIN" | "PRODUCTION_MANAGER" | "FETTLING_MANAGER" | "ACCOUNTS";
+  defaultEmail: string;
+  defaultName: string;
+  /** What the role reaches, printed so the accounts can be handed out. */
+  covers: string;
+}
+
+const ROLE_ACCOUNTS: RoleAccount[] = [
+  {
+    envKey: "ADMIN",
+    role: "ADMIN",
+    defaultEmail: "admin@moltenmetals.com",
+    defaultName: "Administrator",
+    covers: "Everything, including users and settings",
+  },
+  {
+    envKey: "PRODUCTION",
+    role: "PRODUCTION_MANAGER",
+    defaultEmail: "production@moltenmetals.com",
+    defaultName: "Production Manager",
+    covers: "Production, parts, purchase orders, suppliers, companies",
+  },
+  {
+    envKey: "FETTLING",
+    role: "FETTLING_MANAGER",
+    defaultEmail: "fettling@moltenmetals.com",
+    defaultName: "Fettling Manager",
+    covers: "Fettling shop, employees, inventory, production",
+  },
+  {
+    envKey: "ACCOUNTS",
+    role: "ACCOUNTS",
+    defaultEmail: "accounts@moltenmetals.com",
+    defaultName: "Accounts",
+    covers: "Read-only across operations; owns users and settings",
+  },
+];
+
+/**
  * A password nobody has to think of, for when none was supplied.
  *
  * Generated rather than defaulted to something like "admin123": this file runs
@@ -72,41 +120,59 @@ function generatePassword(): string {
 async function main() {
   console.log("\n🏭 Molten Metals ERP - master data setup\n");
 
-  // ---------------------------------------------------------------- admin
+  // -------------------------------------------------------------- accounts
 
-  const adminEmail = (process.env.ADMIN_EMAIL || "admin@moltenmetals.com").trim();
-  const suppliedPassword = process.env.ADMIN_PASSWORD?.trim();
-  const adminName = (process.env.ADMIN_NAME || "Administrator").trim();
+  /** Credentials to print at the end - only for accounts created just now. */
+  const newLogins: Array<{
+    role: string;
+    covers: string;
+    email: string;
+    password: string;
+  }> = [];
 
-  const existingAdmin = await prisma.user.findUnique({
-    where: { email: adminEmail },
-  });
+  for (const account of ROLE_ACCOUNTS) {
+    const email = (
+      process.env[`${account.envKey}_EMAIL`] || account.defaultEmail
+    ).trim();
+    const name = (
+      process.env[`${account.envKey}_NAME`] || account.defaultName
+    ).trim();
+    const suppliedPassword = process.env[`${account.envKey}_PASSWORD`]?.trim();
 
-  let generatedPassword: string | null = null;
+    const existing = await prisma.user.findUnique({ where: { email } });
 
-  if (existingAdmin) {
-    // An existing account keeps its password. Re-running setup must never
-    // lock someone out of their own installation.
-    console.log(`👤 Administrator already exists: ${adminEmail} (unchanged)`);
-  } else {
+    if (existing) {
+      // An existing account keeps its password. Re-running setup must never
+      // lock someone out of their own installation.
+      console.log(`👤 ${account.role.padEnd(18)} exists:  ${email} (unchanged)`);
+      continue;
+    }
+
     const password = suppliedPassword || generatePassword();
-    if (!suppliedPassword) generatedPassword = password;
 
     await prisma.user.create({
       data: {
-        email: adminEmail,
+        email,
         password: await bcrypt.hash(password, 12),
-        name: adminName,
-        role: "ADMIN",
+        name,
+        role: account.role,
         isActive: true,
       },
     });
-    console.log(`👤 Created administrator: ${adminEmail}`);
+
+    console.log(`👤 ${account.role.padEnd(18)} created: ${email}`);
+    newLogins.push({
+      role: account.role,
+      covers: account.covers,
+      email,
+      // A password the operator chose is already theirs to know; only the
+      // generated ones need printing
+      password: suppliedPassword ? "(the one you supplied)" : password,
+    });
   }
 
   // ------------------------------------------------------- activity types
 
-  let activityCount = 0;
   for (const [index, name] of ACTIVITY_TYPES.entries()) {
     await prisma.activityType.upsert({
       where: { name },
@@ -115,9 +181,8 @@ async function main() {
       update: { sortOrder: index + 1 },
       create: { name, sortOrder: index + 1, isActive: true },
     });
-    activityCount++;
   }
-  console.log(`🛠  Fettling operations ready: ${activityCount}`);
+  console.log(`\n🛠  Fettling operations ready: ${ACTIVITY_TYPES.length}`);
 
   // -------------------------------------------------------------- furnaces
 
@@ -149,18 +214,22 @@ async function main() {
 
   console.log("\n✅ Master data is in place.\n");
 
-  if (generatedPassword) {
-    const line = "─".repeat(52);
+  if (newLogins.length > 0) {
+    const line = "─".repeat(68);
     console.log(line);
-    console.log("  SIGN IN WITH THESE DETAILS - SHOWN ONCE");
+    console.log("  SIGN-IN DETAILS - SHOWN ONCE, NOT RECOVERABLE LATER");
     console.log(line);
-    console.log(`  Email:    ${adminEmail}`);
-    console.log(`  Password: ${generatedPassword}`);
+    for (const login of newLogins) {
+      console.log(`  ${login.role}`);
+      console.log(`      ${login.covers}`);
+      console.log(`      Email:    ${login.email}`);
+      console.log(`      Password: ${login.password}`);
+      console.log("");
+    }
     console.log(line);
-    console.log("  Write this down, then change it after signing in.");
-    console.log("  It is not stored anywhere in readable form.\n");
-  } else if (!existingAdmin) {
-    console.log(`  Sign in as ${adminEmail} with the password you supplied.\n`);
+    console.log("  Write these down and hand them out, then have each person");
+    console.log("  change their own password after signing in.");
+    console.log("  Passwords are stored hashed and cannot be read back.\n");
   }
 
   console.log("Next: enter your parts, suppliers, companies and employees,");
