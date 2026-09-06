@@ -2,7 +2,7 @@
 /**
  * Update and run: pull, migrate, build, start.
  *
- * The same job as scripts/deploy.sh, written in Node so it runs on Windows
+ * The same job as deploy.sh, written in Node so it runs on Windows
  * without Git Bash or WSL. The differences are deliberate:
  *
  *   - it always runs, rather than exiting early when already up to date
@@ -22,7 +22,7 @@ import { existsSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
+const REPO = dirname(fileURLToPath(import.meta.url));
 const BRANCH = process.env.BRANCH || "main";
 const PORT = process.env.PORT || "3000";
 

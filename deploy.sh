@@ -7,8 +7,8 @@
 # current server up rather than taking the plant offline. Nothing stops until
 # there is something working to start.
 #
-#   ./scripts/deploy.sh              pull main, migrate, build, restart
-#   ./scripts/deploy.sh --help       every flag
+#   ./deploy.sh              pull main, migrate, build, restart
+#   ./deploy.sh --help       every flag
 #
 set -Eeuo pipefail
 
@@ -24,7 +24,7 @@ FORCE=0
 DRY_RUN=0
 HEALTH_TIMEOUT=90
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="$REPO_ROOT/.deploy"
 LOCK_FILE="$STATE_DIR/deploy.lock.d"
 PID_FILE="$STATE_DIR/app.pid"

@@ -17,8 +17,11 @@ npm run build
 npm start
 ```
 
-`npm run setup` creates the four role accounts and prints their passwords
-**once**. Write them down — see [docs/ACCOUNTS.md](docs/ACCOUNTS.md).
+`npm run setup` creates the four role accounts with simple default passwords
+(`admin@123`, `production@123`, `fettling@123`, `accounts@123`) and prints
+them. **Change each one at first sign-in** — they are in the source, so anyone
+who can reach the login page knows them. Set `<ROLE>_PASSWORD` in `.env` first
+to skip the defaults; see `ACCOUNTS.md`.
 
 It creates reference data only: accounts, fettling operations, furnaces and
 empty stock lines. Your parts, suppliers, companies and employees are entered
@@ -29,13 +32,24 @@ through the app.
 
 ## Updating a running installation
 
+**macOS / Linux**
+
 ```bash
-./scripts/deploy.sh       # pull main, migrate, build, restart
-./scripts/deploy.sh --help
+./deploy.sh               # pull main, migrate, build, restart
+./deploy.sh --help        # every flag
 ```
 
-The build runs before the app is restarted, so a broken commit or a failed
-migration leaves the current server up.
+**Windows**
+
+```bat
+deploy                    :: pull, migrate, build, start
+deploy --no-start         :: stop after the build
+```
+
+`deploy.sh` needs bash. On Windows `deploy.bat` runs `update.mjs` instead,
+which does the same job in plain Node. Either way the build runs **before** the
+app is restarted, so a broken commit or a failed migration leaves the current
+server up. Neither one seeds - `npm run db:seed` is separate, and destructive.
 
 ## Development
 

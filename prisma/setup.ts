@@ -24,7 +24,6 @@ import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { Pool } from "pg";
 import bcrypt from "bcryptjs";
-import { randomBytes } from "node:crypto";
 import { ALL_MATERIAL_TYPES } from "@/lib/ingot";
 import "dotenv/config";
 
@@ -58,9 +57,15 @@ const FURNACES = ["Furnace 1", "Furnace 2"];
 /**
  * One account per role, so every part of the plant can sign in on day one.
  *
- * Each is overridable from the environment - a real foundry wants its own
- * addresses rather than @moltenmetals.com - and each gets its own generated
- * password when none is supplied. Further accounts are added in Settings.
+ * Email, name and password are each overridable from the environment - a real
+ * foundry wants its own addresses rather than @moltenmetals.com. Further
+ * accounts are added afterwards in Settings.
+ *
+ * The default passwords below are simple and public, so that a new machine can
+ * be handed over without a credential exchange. That only holds while they are
+ * temporary: anyone who can reach the login page knows them, so setup prints a
+ * warning and the accounts should be changed on first sign-in. Set
+ * <KEY>_PASSWORD in .env to skip the defaults entirely.
  */
 interface RoleAccount {
   /** Prefix for the <KEY>_EMAIL / <KEY>_NAME / <KEY>_PASSWORD env vars. */
@@ -68,6 +73,8 @@ interface RoleAccount {
   role: "ADMIN" | "PRODUCTION_MANAGER" | "FETTLING_MANAGER" | "ACCOUNTS";
   defaultEmail: string;
   defaultName: string;
+  /** Used when no <KEY>_PASSWORD is set. Simple on purpose - see below. */
+  defaultPassword: string;
   /** What the role reaches, printed so the accounts can be handed out. */
   covers: string;
 }
@@ -77,6 +84,7 @@ const ROLE_ACCOUNTS: RoleAccount[] = [
     envKey: "ADMIN",
     role: "ADMIN",
     defaultEmail: "admin@moltenmetals.com",
+    defaultPassword: "admin@123",
     defaultName: "Administrator",
     covers: "Everything, including users and settings",
   },
@@ -84,6 +92,7 @@ const ROLE_ACCOUNTS: RoleAccount[] = [
     envKey: "PRODUCTION",
     role: "PRODUCTION_MANAGER",
     defaultEmail: "production@moltenmetals.com",
+    defaultPassword: "production@123",
     defaultName: "Production Manager",
     covers: "Production, parts, purchase orders, suppliers, companies",
   },
@@ -91,6 +100,7 @@ const ROLE_ACCOUNTS: RoleAccount[] = [
     envKey: "FETTLING",
     role: "FETTLING_MANAGER",
     defaultEmail: "fettling@moltenmetals.com",
+    defaultPassword: "fettling@123",
     defaultName: "Fettling Manager",
     covers: "Fettling shop, employees, inventory, production",
   },
@@ -98,24 +108,11 @@ const ROLE_ACCOUNTS: RoleAccount[] = [
     envKey: "ACCOUNTS",
     role: "ACCOUNTS",
     defaultEmail: "accounts@moltenmetals.com",
+    defaultPassword: "accounts@123",
     defaultName: "Accounts",
     covers: "Read-only across operations; owns users and settings",
   },
 ];
-
-/**
- * A password nobody has to think of, for when none was supplied.
- *
- * Generated rather than defaulted to something like "admin123": this file runs
- * on real machines, and a known password shipped in a repo is a way in for
- * anyone who can reach the login page. It is printed once, at the end.
- */
-function generatePassword(): string {
-  // Ambiguous characters left out so it survives being read off a screen
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
-  const bytes = randomBytes(16);
-  return Array.from(bytes, (b) => alphabet[b % alphabet.length]).join("");
-}
 
 async function main() {
   console.log("\n🏭 Molten Metals ERP - master data setup\n");
@@ -128,6 +125,8 @@ async function main() {
     covers: string;
     email: string;
     password: string;
+    /** True when it is the built-in default rather than one they chose. */
+    isDefault: boolean;
   }> = [];
 
   for (const account of ROLE_ACCOUNTS) {
@@ -148,7 +147,7 @@ async function main() {
       continue;
     }
 
-    const password = suppliedPassword || generatePassword();
+    const password = suppliedPassword || account.defaultPassword;
 
     await prisma.user.create({
       data: {
@@ -165,9 +164,8 @@ async function main() {
       role: account.role,
       covers: account.covers,
       email,
-      // A password the operator chose is already theirs to know; only the
-      // generated ones need printing
-      password: suppliedPassword ? "(the one you supplied)" : password,
+      password,
+      isDefault: !suppliedPassword,
     });
   }
 
@@ -215,21 +213,33 @@ async function main() {
   console.log("\n✅ Master data is in place.\n");
 
   if (newLogins.length > 0) {
+    const usingDefaults = newLogins.some((l) => l.isDefault);
     const line = "─".repeat(68);
     console.log(line);
-    console.log("  SIGN-IN DETAILS - SHOWN ONCE, NOT RECOVERABLE LATER");
+    console.log("  SIGN-IN DETAILS");
     console.log(line);
     for (const login of newLogins) {
       console.log(`  ${login.role}`);
       console.log(`      ${login.covers}`);
       console.log(`      Email:    ${login.email}`);
-      console.log(`      Password: ${login.password}`);
+      console.log(`      Password: ${login.password}${login.isDefault ? "   (default)" : ""}`);
       console.log("");
     }
     console.log(line);
-    console.log("  Write these down and hand them out, then have each person");
-    console.log("  change their own password after signing in.");
-    console.log("  Passwords are stored hashed and cannot be read back.\n");
+
+    if (usingDefaults) {
+      // Said plainly rather than buried: a default password is only safe for
+      // as long as it takes to sign in and change it
+      console.log("  ⚠  The passwords marked (default) are the built-in ones.");
+      console.log("     They are in the source and anyone who can reach the");
+      console.log("     login page knows them. Change each account's password");
+      console.log("     after the first sign-in, under Profile.");
+      console.log("");
+      console.log("     To set your own instead, put <ROLE>_PASSWORD in .env");
+      console.log("     before running setup - see .env.example.\n");
+    } else {
+      console.log("  Passwords are stored hashed and cannot be read back.\n");
+    }
   }
 
   console.log("Next: enter your parts, suppliers, companies and employees,");
