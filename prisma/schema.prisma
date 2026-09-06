@@ -1,0 +1,434 @@
+// Molten Metals ERP - Database Schema
+// Aluminum Casting Inventory Management System
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// User roles enum
+enum UserRole {
+  ADMIN // Full access to everything
+  PRODUCTION_MANAGER // Production, parts, companies, POs, suppliers, analytics, settings
+  FETTLING_MANAGER // Shop-floor employees, fettling activity, inventory, production
+  ACCOUNTS // Read-only across operations; manages users and settings
+}
+
+// User model
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String
+  name      String
+  role      UserRole @default(PRODUCTION_MANAGER)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  purchaseOrders     PurchaseOrder[]
+  productionRecords  ProductionRecord[]
+  inventoryLogs      InventoryLog[]
+  fettlingActivities FettlingActivity[]
+
+  @@map("users")
+}
+
+// Supplier model for ingot purchases
+model Supplier {
+  id            String   @id @default(cuid())
+  name          String
+  contactPerson String?
+  phone         String?
+  email         String?
+  address       String?
+  gstNumber     String?
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Relations
+  purchaseOrders PurchaseOrder[]
+
+  @@map("suppliers")
+}
+
+// Company/Client model
+model Company {
+  id            String   @id @default(cuid())
+  name          String
+  contactPerson String?
+  phone         String?
+  email         String?
+  address       String?
+  city          String?
+  state         String?
+  pincode       String?
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Relations
+  dispatches Dispatch[]
+
+  @@map("companies")
+}
+
+// Part model - parts that are manufactured
+model Part {
+  id             String   @id @default(cuid())
+  partCode       String   @unique
+  name           String
+  description    String?
+  weightPerPiece Float // Weight in grams
+  expectedScrap  Float    @default(0) // Expected scrap percentage
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  // Relations
+  productionItems    ProductionItem[]
+  dispatches         DispatchItem[]
+  fettlingActivities FettlingActivity[]
+
+  @@map("parts")
+}
+
+// Fettling shop operations an employee can be assigned to
+// A fettling shop operation (riser cutting, belt sander, ...).
+// Admin-managed in Settings so new operations can be added without a deploy.
+model ActivityType {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  isActive  Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  employees  Employee[]
+  activities FettlingActivity[]
+
+  @@map("activity_types")
+}
+
+// Shop-floor employee. Tracked record only - employees do not log in.
+// Created by roles with employee write access; a FETTLING_MANAGER may only reassign tasks.
+model Employee {
+  id             String   @id @default(cuid())
+  employeeCode   String   @unique
+  name           String
+  phone          String?
+  // The activity this employee is currently assigned to. A FETTLING_MANAGER may
+  // move them between activities; each day's actual work is recorded on
+  // FettlingActivity.activityTypeId, so history is preserved independently.
+  activityTypeId String
+  isActive       Boolean  @default(true)
+  joinedAt       DateTime @default(now())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  activities   FettlingActivity[]
+  activityType ActivityType       @relation(fields: [activityTypeId], references: [id])
+
+  @@index([activityTypeId])
+  @@map("employees")
+}
+
+// One day's recorded output for one employee on one operation.
+// Multiple rows per employee per day are allowed (different operations or parts).
+model FettlingActivity {
+  id             String   @id @default(cuid())
+  employeeId     String
+  activityTypeId String
+  date           DateTime @db.Date // the working day this output belongs to
+  partId         String?
+  // Parts the employee handled that day, and how many of those failed
+  // inspection. Accepted is the difference, derived rather than stored so the
+  // two figures can never contradict each other.
+  partsCompleted Int
+  partsRejected  Int      @default(0)
+  notes          String?
+  recordedBy     String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  employee     Employee     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  activityType ActivityType @relation(fields: [activityTypeId], references: [id])
+  part         Part?        @relation(fields: [partId], references: [id])
+  user         User         @relation(fields: [recordedBy], references: [id])
+
+  // One sheet row per employee per day - the daily entry sheet upserts on this
+  @@unique([employeeId, date])
+  @@index([date])
+  @@index([activityTypeId])
+  @@map("fettling_activities")
+}
+
+// Aluminum inventory types enum
+// Every material line is one alloy grade in one form. Scrap keeps the grade of
+// the heat it came off - a runner cut from an LM6 casting is still LM6 metal,
+// and re-melting it into an LM9 heat would contaminate the alloy. So grade is
+// carried on scrap exactly as it is on ingot, and the two never mix.
+enum AluminumType {
+  INGOT_LM6
+  INGOT_LM9
+  INGOT_LM25
+  RUNNER_RAISER_LM6 // Scrap from runner and raiser
+  RUNNER_RAISER_LM9
+  RUNNER_RAISER_LM25
+  SPILLAGE_LM6 // Spillage scrap
+  SPILLAGE_LM9
+  SPILLAGE_LM25
+  REJECTED_PART_LM6 // Rejected part scrap
+  REJECTED_PART_LM9
+  REJECTED_PART_LM25
+}
+
+// Current inventory levels
+model Inventory {
+  id          String       @id @default(cuid())
+  type        AluminumType @unique
+  quantity    Float        @default(0) // Weight in grams
+  lastUpdated DateTime     @default(now())
+
+  @@map("inventory")
+}
+
+// Inventory transaction log
+model InventoryLog {
+  id          String       @id @default(cuid())
+  type        AluminumType
+  action      String // ADD, REMOVE, ADJUST
+  quantity    Float // Weight in grams (positive for add, negative for remove)
+  previousQty Float // Previous quantity before transaction
+  newQty      Float // New quantity after transaction
+  reference   String? // Reference to related entity (PO, Production, etc.)
+  referenceId String?
+  notes       String?
+  createdBy   String
+  createdAt   DateTime     @default(now())
+
+  // Relations
+  user User @relation(fields: [createdBy], references: [id])
+
+  @@map("inventory_logs")
+}
+
+// Purchase order status
+enum POStatus {
+  PENDING
+  CONFIRMED
+  IN_TRANSIT
+  DELIVERED
+  CANCELLED
+}
+
+// Purchase Order for buying ingots
+model PurchaseOrder {
+  id            String    @id @default(cuid())
+  poNumber      String    @unique
+  supplierId    String
+  orderDate     DateTime  @default(now())
+  expectedDate  DateTime?
+  deliveredDate DateTime?
+  quantity      Float // Weight in grams
+  // The ingot grade ordered. Delivery adds the quantity to this grade's stock.
+  ingotType     AluminumType @default(INGOT_LM6)
+  pricePerKg    Float // Price per kg
+  totalAmount   Float // Total amount
+  status        POStatus  @default(PENDING)
+  notes         String?
+  createdBy     String
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // Relations
+  supplier Supplier @relation(fields: [supplierId], references: [id])
+  user     User     @relation(fields: [createdBy], references: [id])
+
+  @@map("purchase_orders")
+}
+
+// Production/Manufacturing record
+// Melting furnace (bhatti) a production batch was run on.
+// Names are managed by an admin in Settings.
+model Furnace {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  productionRecords ProductionRecord[]
+
+  @@map("furnaces")
+}
+
+// A batch is entered in stages, because that is how a heat actually runs: the
+// furnace is charged first, the melt is assayed a few hours later, and the
+// castings are only counted once the shift has finished with them. Forcing all
+// of it into one form meant the operator either waited hours before recording
+// the charge, or invented figures to get past the form.
+enum ProductionStatus {
+  PENDING // Charged: furnace, alloy and metal in. Nothing else known yet.
+  UPDATED // Melt assayed: composition and/or density index recorded.
+  COMPLETED // Castings counted and scrap booked. The batch is closed.
+}
+
+model ProductionRecord {
+  id          String   @id @default(cuid())
+  batchNumber String   @unique
+  // Optional so batches recorded before furnace tracking remain valid
+  furnaceId   String?
+  date        DateTime @default(now())
+
+  // Input
+  aluminumUsed Float // Total aluminum used in grams, the sum of the grades below
+
+  // The alloy this heat was run on. One grade per batch: it decides which
+  // scrap may be charged back in, and which grade the scrap coming off the
+  // batch is booked to.
+  ingotGrade AluminumType @default(INGOT_LM6)
+
+  // Kept per grade so historic multi-grade batches still read correctly.
+  aluminumUsedLM6  Float @default(0)
+  aluminumUsedLM9  Float @default(0)
+  aluminumUsedLM25 Float @default(0)
+
+  // Scrap charged back into the melt (in grams). Optional per batch, so these
+  // default to 0 and every batch recorded before scrap re-melt was tracked
+  // stays valid.
+  runnerRaiserScrapUsed Float @default(0)
+  spillageScrapUsed     Float @default(0)
+  rejectedPartScrapUsed Float @default(0)
+  totalScrapUsed        Float @default(0)
+
+  // How far through the three entry stages this batch is
+  status ProductionStatus @default(COMPLETED)
+
+  // Output - batch totals, summed from the line items. Zero until the batch is
+  // completed, because until then the castings have not been counted.
+  quantityProduced Int @default(0) // Number of parts produced
+  goodParts        Int @default(0) // Number of good parts
+  rejectedParts    Int @default(0) // Number of rejected parts
+
+  // Scrap generated (in grams)
+  runnerRaiserScrap Float @default(0)
+  spillageScrap     Float @default(0)
+  rejectedPartScrap Float @default(0)
+
+  // Free-form composition / custom fields entered per batch, stored as an
+  // array of { key, value } objects. Keys are user-defined (Si, Fe, Cu, ...)
+  // rather than fixed columns, so a foundry can record whatever it measures.
+  composition Json?
+
+  // Melt quality - Reduced Pressure Test.
+  // Optional so batches recorded before DI tracking remain valid.
+  densityAtmospheric Float? // rho_A, sample solidified at atmospheric pressure
+  densityVacuum      Float? // rho_B, sample solidified under reduced pressure
+  densityIndex       Float? // DI = (rho_A - rho_B) / rho_A * 100, stored for querying
+
+  // Calculated fields stored for quick access
+  totalScrap Float @default(0)
+  efficiency Float @default(0) // Percentage
+
+  notes     String?
+  createdBy String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  user    User             @relation(fields: [createdBy], references: [id])
+  furnace Furnace?         @relation(fields: [furnaceId], references: [id])
+  items   ProductionItem[]
+
+  @@map("production_records")
+}
+
+// Dispatch to clients
+// One part line within a production batch. A batch can cast several different
+// parts, so per-part quantities live here and the record holds the totals.
+model ProductionItem {
+  id                 String @id @default(cuid())
+  productionRecordId String
+  partId             String
+
+  quantityProduced Int
+  goodParts        Int
+  rejectedParts    Int @default(0)
+
+  createdAt DateTime @default(now())
+
+  productionRecord ProductionRecord @relation(fields: [productionRecordId], references: [id], onDelete: Cascade)
+  part             Part             @relation(fields: [partId], references: [id])
+
+  @@index([productionRecordId])
+  @@index([partId])
+  @@map("production_items")
+}
+
+model Dispatch {
+  id             String   @id @default(cuid())
+  dispatchNumber String   @unique
+  companyId      String
+  dispatchDate   DateTime @default(now())
+  vehicleNumber  String?
+  driverName     String?
+  notes          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  // Relations
+  company Company        @relation(fields: [companyId], references: [id])
+  items   DispatchItem[]
+
+  @@map("dispatches")
+}
+
+// Dispatch items
+model DispatchItem {
+  id         String @id @default(cuid())
+  dispatchId String
+  partId     String
+  quantity   Int
+  weight     Float // Total weight in grams
+
+  // Relations
+  dispatch Dispatch @relation(fields: [dispatchId], references: [id], onDelete: Cascade)
+  part     Part     @relation(fields: [partId], references: [id])
+
+  @@map("dispatch_items")
+}
+
+// Analytics snapshots for dashboard (daily aggregates)
+model DailyAnalytics {
+  id   String   @id @default(cuid())
+  date DateTime @unique @db.Date
+
+  // Inventory levels at end of day
+  ingotStock        Float @default(0)
+  runnerRaiserStock Float @default(0)
+  spillageStock     Float @default(0)
+  rejectedPartStock Float @default(0)
+
+  // Daily totals
+  totalAluminumUsed   Float @default(0)
+  totalScrapGenerated Float @default(0)
+  totalPartsProduced  Int   @default(0)
+  totalRejectedParts  Int   @default(0)
+  totalDispatched     Float @default(0)
+
+  // Purchases
+  totalPurchased Float @default(0)
+  purchaseAmount Float @default(0)
+
+  // Efficiency
+  avgEfficiency Float @default(0)
+
+  createdAt DateTime @default(now())
+
+  @@map("daily_analytics")
+}
