@@ -2,14 +2,20 @@
 
 import { cn } from "@/lib/utils";
 import { LucideIcon, PackageOpen } from "lucide-react";
-import { Button } from "./button";
 
 interface EmptyStateProps {
   icon?: LucideIcon;
   title: string;
   description?: string;
-  actionLabel?: string;
-  onAction?: () => void;
+  /**
+   * What to offer instead of the missing data - usually the button that
+   * creates the first one.
+   *
+   * Taken as a node rather than a label and a callback: every caller wants an
+   * icon in that button, and a couple offer more than one action, neither of
+   * which a label-plus-handler pair can express.
+   */
+  action?: React.ReactNode;
   className?: string;
 }
 
@@ -17,8 +23,7 @@ export function EmptyState({
   icon: Icon = PackageOpen,
   title,
   description,
-  actionLabel,
-  onAction,
+  action,
   className,
 }: EmptyStateProps) {
   return (
@@ -39,9 +44,7 @@ export function EmptyState({
           {description}
         </p>
       )}
-      {actionLabel && onAction && (
-        <Button onClick={onAction}>{actionLabel}</Button>
-      )}
+      {action}
     </div>
   );
 }
