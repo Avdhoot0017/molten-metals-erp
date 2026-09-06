@@ -1,6 +1,43 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Molten Metals ERP
 
-## Getting Started
+Aluminium casting inventory, production and fettling management.
+
+## Setting up a new machine
+
+```bash
+git clone git@github.com:Avdhoot0017/molten-metals-erp.git
+cd molten-metals-erp
+npm install
+
+cp .env.example .env      # Windows: copy .env.example .env
+                          # then fill in DATABASE_URL and JWT_SECRET
+
+npm run setup             # migrate + generate + master data
+npm run build
+npm start
+```
+
+`npm run setup` creates the four role accounts and prints their passwords
+**once**. Write them down — see [docs/ACCOUNTS.md](docs/ACCOUNTS.md).
+
+It creates reference data only: accounts, fettling operations, furnaces and
+empty stock lines. Your parts, suppliers, companies and employees are entered
+through the app.
+
+> `npm run db:seed` is a different thing — it wipes the operational tables and
+> fills them with demo data. Local development only.
+
+## Updating a running installation
+
+```bash
+./scripts/deploy.sh       # pull main, migrate, build, restart
+./scripts/deploy.sh --help
+```
+
+The build runs before the app is restarted, so a broken commit or a failed
+migration leaves the current server up.
+
+## Development
 
 First, run the development server:
 
