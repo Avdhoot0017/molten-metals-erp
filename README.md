@@ -38,13 +38,19 @@ Run once, after setting the machine up:
 install-desktop-icon.bat
 ```
 
-That puts a **Molten Metals ERP** icon on the Desktop. Double-clicking it
-starts the ERP and opens it in the browser - no terminal, no VS Code.
+That puts a **Molten Metals ERP** icon on the Desktop. Double-clicking it does
+the whole thing - fetches the latest code, applies any new migrations,
+rebuilds, starts, and opens the browser. No terminal, no VS Code, nothing to
+run first.
 
 The window it opens is the server log. **Closing that window stops the ERP.**
 
-If the app is already running, the icon just opens the browser rather than
-trying to start a second copy.
+- Already running? It just opens the browser instead of starting a second copy.
+- No network? It warns and starts with the code already on the machine.
+- Local edits on that machine? It skips the pull rather than burying them, and
+  still starts.
+- A failed migration or build **does** stop it - better than running something
+  broken.
 
 ## Updating a running installation
 

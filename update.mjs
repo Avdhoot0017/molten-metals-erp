@@ -90,6 +90,7 @@ if (!existsSync(join(REPO, ".env"))) {
 // -------------------------------------------------------------------- pull
 
 const headBefore = capture("git", ["rev-parse", "HEAD"]);
+let skipPull = false;
 
 if (noPull) {
   step("Skipping pull (--no-pull)");
@@ -99,30 +100,42 @@ if (noPull) {
 } else {
   step(`Pulling ${BRANCH}`);
 
-  // Uncommitted work would be silently buried by a pull
+  // Uncommitted work would be buried by a pull, so the pull is skipped - but
+  // the ERP still starts. This runs from a desktop icon on the shop floor, and
+  // refusing to start the plant's system over a stray file is the wrong call:
+  // skipping the pull protects that work just as well as stopping does.
   const dirty = capture("git", ["status", "--porcelain"]);
   if (dirty) {
-    console.log(dirty.split("\n").slice(0, 15).join("\n"));
-    fail("Working tree has uncommitted changes. Commit or stash them first.");
+    warn("There are uncommitted changes here, so the pull was skipped:");
+    for (const line of dirty.split("\n").slice(0, 10)) info(`    ${line}`);
+    warn("Starting with the code already on this machine.");
+    skipPull = true;
   }
 
-  if (run("git", ["fetch", "--prune", "origin", BRANCH]) !== 0) {
-    fail("git fetch failed - check the network and your access to the remote.");
-  }
-
-  // Fast-forward only: an update should never invent a merge commit
-  if (run("git", ["merge", "--ff-only", `origin/${BRANCH}`]) !== 0) {
-    fail(
-      `Cannot fast-forward to origin/${BRANCH} - the local branch has diverged.\n` +
-        "  Someone needs to reconcile them by hand."
-    );
-  }
-
-  const headAfter = capture("git", ["rev-parse", "HEAD"]);
-  if (headAfter === headBefore) {
-    ok(`Already at ${headBefore?.slice(0, 8)} - no new commits`);
+  // A machine with no network must still be able to start the ERP, so a
+  // failed fetch is a loud warning rather than the end of the run. Anything
+  // that fails AFTER this point - a migration, a build - does stop it, because
+  // carrying on would mean running something broken.
+  if (skipPull) {
+    // already reported above
+  } else if (run("git", ["fetch", "--prune", "origin", BRANCH]) !== 0) {
+    warn("Could not reach the remote - no network, or no access to it.");
+    warn("Carrying on with the code already on this machine.");
   } else {
-    ok(`Updated ${headBefore?.slice(0, 8)} -> ${headAfter?.slice(0, 8)}`);
+    // Fast-forward only: an update should never invent a merge commit
+    if (run("git", ["merge", "--ff-only", `origin/${BRANCH}`]) !== 0) {
+      fail(
+        `Cannot fast-forward to origin/${BRANCH} - the local branch has diverged.\n` +
+          "  Someone needs to reconcile them by hand."
+      );
+    }
+
+    const headAfter = capture("git", ["rev-parse", "HEAD"]);
+    if (headAfter === headBefore) {
+      ok(`Already at ${headBefore?.slice(0, 8)} - no new commits`);
+    } else {
+      ok(`Updated ${headBefore?.slice(0, 8)} -> ${headAfter?.slice(0, 8)}`);
+    }
   }
 }
 
