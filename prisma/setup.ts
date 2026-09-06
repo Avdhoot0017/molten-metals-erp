@@ -19,6 +19,12 @@
  *
  *   npm run db:setup      just this file
  *   npm run setup         migrate + generate + this file
+ *
+ *   npm run db:setup -- --reset-passwords
+ *       Also puts the four role accounts back to their default (or .env)
+ *       passwords. Normally setup leaves an existing account alone so it can
+ *       never lock anyone out - this is the way back in when nobody knows the
+ *       password any more, e.g. after restoring a database onto a new machine.
  */
 import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
@@ -41,6 +47,18 @@ if (!connectionString) {
 const pool = new Pool({ connectionString });
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
+
+const RESET_PASSWORDS = process.argv.includes("--reset-passwords");
+
+/** Host and database name only - never the user or password. */
+function describeConnection(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.hostname}:${parsed.port || "5432"}${parsed.pathname}`;
+  } catch {
+    return "(unparseable DATABASE_URL)";
+  }
+}
 
 /** Fettling shop operations. Editable afterwards in Settings. */
 const ACTIVITY_TYPES = [
@@ -115,7 +133,10 @@ const ROLE_ACCOUNTS: RoleAccount[] = [
 ];
 
 async function main() {
-  console.log("\n🏭 Molten Metals ERP - master data setup\n");
+  console.log("\n🏭 Molten Metals ERP - master data setup");
+  // Printed because the commonest cause of "my data is missing" is being
+  // pointed at a different database than the one holding it
+  console.log(`   Database: ${describeConnection(connectionString!)}\n`);
 
   // -------------------------------------------------------------- accounts
 
@@ -140,7 +161,7 @@ async function main() {
 
     const existing = await prisma.user.findUnique({ where: { email } });
 
-    if (existing) {
+    if (existing && !RESET_PASSWORDS) {
       // An existing account keeps its password. Re-running setup must never
       // lock someone out of their own installation.
       console.log(`👤 ${account.role.padEnd(18)} exists:  ${email} (unchanged)`);
@@ -148,18 +169,28 @@ async function main() {
     }
 
     const password = suppliedPassword || account.defaultPassword;
+    const hashed = await bcrypt.hash(password, 12);
 
-    await prisma.user.create({
-      data: {
-        email,
-        password: await bcrypt.hash(password, 12),
-        name,
-        role: account.role,
-        isActive: true,
-      },
-    });
-
-    console.log(`👤 ${account.role.padEnd(18)} created: ${email}`);
+    if (existing) {
+      // --reset-passwords only: the role and active flag are restored too, so
+      // an account that was disabled or demoted can still get someone back in
+      await prisma.user.update({
+        where: { email },
+        data: { password: hashed, role: account.role, isActive: true },
+      });
+      console.log(`👤 ${account.role.padEnd(18)} RESET:   ${email}`);
+    } else {
+      await prisma.user.create({
+        data: {
+          email,
+          password: hashed,
+          name,
+          role: account.role,
+          isActive: true,
+        },
+      });
+      console.log(`👤 ${account.role.padEnd(18)} created: ${email}`);
+    }
     newLogins.push({
       role: account.role,
       covers: account.covers,
@@ -210,6 +241,34 @@ async function main() {
 
   // ----------------------------------------------------------------- done
 
+  // ------------------------------------------------------------ what is here
+
+  // Printed so "my old data is missing" can be answered on the spot: either
+  // the rows are here and something else is wrong, or this is the wrong
+  // database and the data is still sitting in the other one.
+  const [users, parts, suppliers, companies, employees, batches, orders, logs] =
+    await Promise.all([
+      prisma.user.count(),
+      prisma.part.count(),
+      prisma.supplier.count(),
+      prisma.company.count(),
+      prisma.employee.count(),
+      prisma.productionRecord.count(),
+      prisma.purchaseOrder.count(),
+      prisma.inventoryLog.count(),
+    ]);
+
+  console.log("\n📊 What this database holds now:");
+  console.log(`   users ${users} · parts ${parts} · suppliers ${suppliers} · companies ${companies}`);
+  console.log(`   employees ${employees} · production batches ${batches} · purchase orders ${orders} · stock movements ${logs}`);
+
+  if (parts === 0 && batches === 0 && orders === 0) {
+    console.log("");
+    console.log("   ⚠  No operational records here. If you expected existing data,");
+    console.log("      DATABASE_URL is probably pointing at the wrong database -");
+    console.log("      check the name at the top of this output against your backup.");
+  }
+
   console.log("\n✅ Master data is in place.\n");
 
   if (newLogins.length > 0) {
@@ -240,6 +299,15 @@ async function main() {
     } else {
       console.log("  Passwords are stored hashed and cannot be read back.\n");
     }
+  }
+
+  if (newLogins.length === 0) {
+    // Every account already existed, so no password here changed. Someone who
+    // cannot sign in needs to be told that outright, not left guessing.
+    console.log("  All four accounts already existed, so no password was changed.");
+    console.log("  They still have whatever passwords they had before.\n");
+    console.log("  Locked out? Put them back to the defaults with:");
+    console.log("      npm run db:setup -- --reset-passwords\n");
   }
 
   console.log("Next: enter your parts, suppliers, companies and employees,");

@@ -164,7 +164,7 @@ export default function LoginPage() {
       <div className="hidden lg:flex lg:w-1/2 relative overflow-hidden">
         {/* Background Image */}
         <Image
-          src="/hookah-bowl-with-heated-coals-it-particles-flying-around.jpg"
+          src="/hookah-bowl-with-heated-coals-it-particles-flying-around.png"
           alt="Glowing hot coals throwing off sparks"
           fill
           priority
