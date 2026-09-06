@@ -3,7 +3,17 @@ import prisma from "@/lib/prisma";
 import { getSession } from "@/lib/auth";
 import { canRead, canWrite } from "@/lib/permissions";
 
-// GET - List furnaces (any signed-in user; the production form needs them)
+/**
+ * GET - the furnace list.
+ *
+ * Readable by anyone who can record production OR manage settings. A batch
+ * cannot be entered without choosing the furnace it ran on, and the role that
+ * runs the shop floor does not necessarily hold settings access - gating this
+ * on settings alone left the fettling manager with an empty dropdown and no
+ * way to record anything.
+ *
+ * Creating, renaming and removing furnaces stays with settings write, below.
+ */
 export async function GET(request: NextRequest) {
   try {
     const session = await getSession();
@@ -11,8 +21,7 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    
-    if (!canRead(session, "settings")) {
+    if (!canRead(session, "settings") && !canRead(session, "production")) {
       return NextResponse.json(
         { error: "You do not have access to this data" },
         { status: 403 }

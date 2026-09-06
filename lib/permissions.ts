@@ -43,22 +43,26 @@ export const PERMISSIONS: Record<UserRole, Record<Resource, Access>> = {
     settings: WRITE,
   },
 
-  // Runs the production side of the plant
+  // Runs the plant. Full access, the same as ADMIN - the difference between
+  // the two is not what they can reach but what they may undo: correcting a
+  // completed production batch stays with ADMIN, because it moves stock that
+  // has already been booked. See canAmendCompletedBatch below.
   PRODUCTION_MANAGER: {
-    dashboard: READ,
-    employees: NONE,
-    fettling: NONE,
-    inventory: NONE,
+    dashboard: WRITE,
+    employees: WRITE,
+    fettling: WRITE,
+    inventory: WRITE,
     production: WRITE,
     parts: WRITE,
     companies: WRITE,
     purchaseOrders: WRITE,
     suppliers: WRITE,
-    analytics: READ,
+    analytics: WRITE,
     settings: WRITE,
   },
 
-  // Runs the fettling shop floor
+  // Runs the fettling shop floor. Holds inventory because the shop books
+  // scrap in and out as it works.
   FETTLING_MANAGER: {
     dashboard: READ,
     // May view employees and move them between operations, but not add or
