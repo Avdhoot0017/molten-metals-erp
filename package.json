@@ -9,13 +9,14 @@
     "lint": "eslint",
     "setup": "prisma migrate deploy && prisma generate && npx tsx prisma/setup.ts",
     "db:setup": "npx tsx prisma/setup.ts",
+    "update": "node scripts/update.mjs",
+    "deploy": "bash scripts/deploy.sh",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
     "db:seed": "npx tsx prisma/seed.ts",
     "db:studio": "prisma studio",
-    "db:reset": "prisma migrate reset",
-    "deploy": "bash scripts/deploy.sh"
+    "db:reset": "prisma migrate reset"
   },
   "prisma": {
     "seed": "npx tsx prisma/seed.ts"
