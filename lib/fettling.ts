@@ -1,4 +1,5 @@
 import type { SessionUser } from "@/types";
+import { canWrite } from "@/lib/permissions";
 
 /**
  * Parses a YYYY-MM-DD string into a UTC-midnight Date.
@@ -26,19 +27,35 @@ export function toDateOnlyString(date: Date): string {
 }
 
 /**
- * A fettling manager may only enter or amend the current day's sheet — once a
- * day has passed its numbers are locked and only an admin can correct them.
+ * How far back a manager may still enter or correct a day: today, and the day
+ * before it.
+ *
+ * A shift often gets written up the next morning, so locking at midnight would
+ * make yesterday's real work unrecordable. Beyond that the numbers have been
+ * reported on, and changing them becomes a correction rather than data entry.
+ */
+export const EDIT_WINDOW_DAYS = 1;
+
+/**
+ * Whether this person may enter or amend the sheet for a given day.
+ *
+ * Who may edit at all comes from the permission matrix, so it follows the role
+ * definitions rather than a second list here. WHEN they may edit is the extra
+ * rule: an admin has no window, everyone else has today and yesterday.
  */
 export function canEditSheetForDate(
   user: SessionUser | null,
   date: Date
 ): boolean {
   if (!user) return false;
+  if (!canWrite(user, "fettling")) return false;
   if (user.role === "ADMIN") return true;
-  if (user.role !== "FETTLING_MANAGER") return false;
-  return date.getTime() === todayUtc().getTime();
+
+  const daysAgo = (todayUtc().getTime() - date.getTime()) / 86_400_000;
+  // A day in the future is not editable either - it has not happened yet
+  return daysAgo >= 0 && daysAgo <= EDIT_WINDOW_DAYS;
 }
 
 /** Human-readable reason a sheet is locked, for API error messages. */
 export const SHEET_LOCKED_MESSAGE =
-  "This date is locked. Only an admin can change a past day's sheet.";
+  "This date is locked. You can only record today and yesterday - ask an admin to change an older day.";

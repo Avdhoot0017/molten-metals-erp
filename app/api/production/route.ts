@@ -5,17 +5,75 @@ import { getSession } from "@/lib/auth";
 import { canRead, canWrite } from "@/lib/permissions";
 import { parsePagination, buildPaginationMeta } from "@/lib/pagination";
 import { materialType } from "@/lib/ingot";
-import { MAX_OPEN_BATCHES_PER_FURNACE } from "@/lib/production";
+import {
+  MAX_OPEN_BATCHES_PER_FURNACE,
+  batchPrefix,
+  sequenceOf,
+  formatBatchNumber,
+} from "@/lib/production";
 import { Prisma } from "@prisma/client";
 
-// Helper to generate batch number
-function generateBatchNumber(): string {
-  const date = new Date();
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  const random = Math.floor(Math.random() * 1000).toString().padStart(3, "0");
-  return `BATCH-${year}${month}${day}-${random}`;
+/**
+ * Runs `work` inside a transaction with a freshly allocated batch number,
+ * retrying if another request took that number first.
+ *
+ * A few attempts is plenty: a clash needs two batches recorded in the same
+ * moment, and each retry reads the new highest sequence.
+ */
+async function runWithBatchNumber<T>(
+  work: (
+    batchNumber: string,
+    tx: Prisma.TransactionClient
+  ) => Promise<T>
+): Promise<T> {
+  const MAX_ATTEMPTS = 5;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const batchNumber = await nextBatchNumber(new Date());
+    try {
+      return await prisma.$transaction((tx) => work(batchNumber, tx));
+    } catch (error) {
+      const clash =
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === "P2002" &&
+        String(error.meta?.target ?? "").includes("batchNumber");
+
+      if (!clash || attempt === MAX_ATTEMPTS) throw error;
+      // Someone else took it; the next read picks up their number
+    }
+  }
+
+  // Unreachable - the loop either returns or throws
+  throw new Error("Could not allocate a batch number");
+}
+
+/**
+ * The next batch number for the month a batch is being recorded in.
+ *
+ * Read from the highest sequence already used that month rather than a stored
+ * counter, so there is one source of truth and nothing to fall out of step if
+ * a batch is ever removed by hand.
+ *
+ * Two batches created at the same instant would compute the same number, so
+ * the caller retries on the unique constraint - the database has the final say
+ * on which one got there first.
+ */
+async function nextBatchNumber(when: Date): Promise<string> {
+  const prefix = batchPrefix(when);
+
+  // Only this month's numbers matter, and only ones in the current format -
+  // older batches used BATCH-20260906-417 and must not be read as a sequence
+  const thisMonth = await prisma.productionRecord.findMany({
+    where: { batchNumber: { startsWith: prefix } },
+    select: { batchNumber: true },
+  });
+
+  const highest = thisMonth.reduce((max, record) => {
+    const sequence = sequenceOf(record.batchNumber, prefix);
+    return sequence !== null && sequence > max ? sequence : max;
+  }, 0);
+
+  return formatBatchNumber(prefix, highest + 1);
 }
 
 // GET - List all production records
@@ -283,20 +341,13 @@ const body = await request.json();
       }
     }
 
-    // Generate unique batch number
-    let batchNumber = generateBatchNumber();
-    let attempts = 0;
-    while (attempts < 10) {
-      const existing = await prisma.productionRecord.findUnique({
-        where: { batchNumber },
-      });
-      if (!existing) break;
-      batchNumber = generateBatchNumber();
-      attempts++;
-    }
-
-    // Create production record and update inventories in a transaction
-    const result = await prisma.$transaction(async (tx) => {
+    // Create production record and update inventories in a transaction.
+    //
+    // The batch number is computed inside the retry: two heats recorded at the
+    // same instant would work out the same number, and the unique constraint
+    // is what decides which one got there first. Recomputing on a clash is
+    // simpler and safer than holding a lock or a separate counter table.
+    const result = await runWithBatchNumber(async (batchNumber, tx) => {
       // Create production record
       const record = await tx.productionRecord.create({
         data: {

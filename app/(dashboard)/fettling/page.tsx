@@ -382,8 +382,11 @@ export default function FettlingPage() {
         <div className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800">
           <Lock className="mt-0.5 h-4 w-4 shrink-0" />
           <span>
-            This day is closed for editing. You can still look at what was
-            recorded.
+            {/* Say which days ARE open, not just that this one is shut -
+                otherwise the next click is another locked day */}
+            This day is closed for editing. You can record today and
+            yesterday; ask an admin to change anything older. What was
+            recorded here is still visible.
           </span>
         </div>
       )}
