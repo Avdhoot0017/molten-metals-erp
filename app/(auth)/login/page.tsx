@@ -4,6 +4,7 @@ import * as React from "react";
 import { Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Image from "next/image";
+import Link from "next/link";
 import { Mail, Lock, Eye, EyeOff } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -126,12 +127,12 @@ function LoginForm() {
               Remember me
             </span>
           </label>
-          <a
-            href="#"
+          <Link
+            href="/register"
             className="text-sm text-[var(--primary)] hover:underline"
           >
             Forgot password?
-          </a>
+          </Link>
         </div>
 
         <Button type="submit" className="w-full h-12 text-base" isLoading={isLoading}>
@@ -141,9 +142,9 @@ function LoginForm() {
 
       <p className="text-center text-sm text-[var(--muted-foreground)]">
         Don&apos;t have an account?{" "}
-        <a href="/register" className="text-[var(--primary)] hover:underline">
+        <Link href="/register" className="text-[var(--primary)] hover:underline">
           Contact admin
-        </a>
+        </Link>
       </p>
     </div>
   );
