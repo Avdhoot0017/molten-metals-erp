@@ -12,6 +12,7 @@ import {
   EyeOff,
   Check,
   AlertTriangle,
+  Info,
   X,
   Plus,
   Trash2,
@@ -65,6 +66,9 @@ export default function SettingsPage() {
   const [furnaces, setFurnaces] = React.useState<Furnace[]>([]);
   const [furnacesLoading, setFurnacesLoading] = React.useState(true);
   const [furnaceError, setFurnaceError] = React.useState<string | null>(null);
+  // An outcome worth reporting that is not a failure - e.g. a furnace that was
+  // deactivated rather than deleted because batches still reference it
+  const [furnaceNotice, setFurnaceNotice] = React.useState<string | null>(null);
   const [newFurnaceName, setNewFurnaceName] = React.useState("");
   const [editingFurnaceId, setEditingFurnaceId] = React.useState<string | null>(null);
   const [editingFurnaceName, setEditingFurnaceName] = React.useState("");
@@ -74,6 +78,7 @@ export default function SettingsPage() {
   const [activities, setActivities] = React.useState<ActivityTypeRow[]>([]);
   const [activitiesLoading, setActivitiesLoading] = React.useState(true);
   const [activityError, setActivityError] = React.useState<string | null>(null);
+  const [activityNotice, setActivityNotice] = React.useState<string | null>(null);
   const [newActivityName, setNewActivityName] = React.useState("");
   const [editingActivityId, setEditingActivityId] = React.useState<string | null>(null);
   const [editingActivityName, setEditingActivityName] = React.useState("");
@@ -120,6 +125,7 @@ export default function SettingsPage() {
   const [users, setUsers] = React.useState<UserData[]>([]);
   const [usersLoading, setUsersLoading] = React.useState(true);
   const [userError, setUserError] = React.useState<string | null>(null);
+  const [userNotice, setUserNotice] = React.useState<string | null>(null);
   const [userBusy, setUserBusy] = React.useState(false);
 
   const [isUserModalOpen, setIsUserModalOpen] = React.useState(false);
@@ -139,6 +145,52 @@ export default function SettingsPage() {
     { id: "activities" as TabType, label: "Activities", icon: Wrench },
     { id: "users" as TabType, label: "Users", icon: Users },
   ];
+
+  /**
+   * One banner shape for the whole page.
+   *
+   * A failure and an outcome are different things - "could not delete" is red,
+   * "deactivated instead of deleted" is amber - and previously both went into
+   * the same error slot, where the next successful reload wiped them.
+   */
+  const Banner = ({
+    tone,
+    children,
+  }: {
+    tone: "error" | "notice";
+    children: React.ReactNode;
+  }) =>
+    tone === "error" ? (
+      <div className="flex items-start gap-2 rounded-lg border border-[var(--error)]/30 bg-red-50 p-3 text-sm text-[var(--error)]">
+        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+        <span>{children}</span>
+      </div>
+    ) : (
+      <div className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800">
+        <Info className="mt-0.5 h-4 w-4 shrink-0" />
+        <span>{children}</span>
+      </div>
+    );
+
+  /**
+   * The result of a save, shown beside the button that caused it.
+   *
+   * There is a banner in the page header too, but every Save sits at the foot
+   * of a long tab - by the time you have scrolled down to click it, the header
+   * is off screen and the confirmation goes unseen.
+   */
+  const SaveResult = () =>
+    saveError ? (
+      <span className="flex items-center gap-1.5 text-sm text-[var(--error)]">
+        <AlertTriangle className="h-4 w-4 shrink-0" />
+        {saveError}
+      </span>
+    ) : saveSuccess ? (
+      <span className="flex items-center gap-1.5 text-sm text-[var(--success)]">
+        <Check className="h-4 w-4 shrink-0" />
+        Saved
+      </span>
+    ) : null;
 
   /** Shared tail of every save: report the outcome the same way. */
   const finishSave = (error: string | null) => {
@@ -351,14 +403,19 @@ export default function SettingsPage() {
   };
 
   const handleDeleteUser = async (userId: string) => {
+    setUserNotice(null);
     setUserBusy(true);
     setUserError(null);
     try {
       const res = await fetch(`/api/users?id=${userId}`, { method: "DELETE" });
       const result = await res.json();
       if (result.success) {
-        if (result.message) setUserError(result.message);
+        // Reload first - it clears the banner, which would otherwise wipe the
+        // message before anyone could read it
         await loadUsers();
+        // An account with linked records is deactivated, not deleted. That is
+        // the outcome, not a failure.
+        if (result.message) setUserNotice(result.message);
       } else {
         setUserError(result.error || "Failed to remove user");
       }
@@ -425,10 +482,13 @@ export default function SettingsPage() {
       </div>
 
       <div className="pt-4 border-t border-[var(--border)]">
-        <Button onClick={handleSaveProfile} isLoading={isLoading}>
-          <Save className="h-4 w-4 mr-2" />
-          Save Changes
-        </Button>
+        <div className="flex flex-wrap items-center gap-4">
+          <Button onClick={handleSaveProfile} isLoading={isLoading}>
+            <Save className="h-4 w-4 mr-2" />
+            Save Changes
+          </Button>
+          <SaveResult />
+        </div>
       </div>
     </div>
   );
@@ -578,10 +638,13 @@ export default function SettingsPage() {
       </div>
 
       <div className="pt-4 border-t border-[var(--border)]">
-        <Button onClick={handleSavePassword} isLoading={isLoading}>
-          <Save className="h-4 w-4 mr-2" />
-          Update Password
-        </Button>
+        <div className="flex flex-wrap items-center gap-4">
+          <Button onClick={handleSavePassword} isLoading={isLoading}>
+            <Save className="h-4 w-4 mr-2" />
+            Update Password
+          </Button>
+          <SaveResult />
+        </div>
       </div>
     </div>
   );
@@ -725,10 +788,13 @@ export default function SettingsPage() {
       </div>
 
       <div className="pt-4 border-t border-[var(--border)]">
-        <Button onClick={handleSaveSystem} isLoading={isLoading}>
-          <Save className="h-4 w-4 mr-2" />
-          Save Settings
-        </Button>
+        <div className="flex flex-wrap items-center gap-4">
+          <Button onClick={handleSaveSystem} isLoading={isLoading}>
+            <Save className="h-4 w-4 mr-2" />
+            Save Settings
+          </Button>
+          <SaveResult />
+        </div>
       </div>
     </div>
   );
@@ -745,11 +811,8 @@ export default function SettingsPage() {
         </Button>
       </div>
 
-      {userError && (
-        <div className="rounded-lg bg-amber-100 p-3 text-sm text-amber-800">
-          {userError}
-        </div>
-      )}
+      {userError && <Banner tone="error">{userError}</Banner>}
+      {userNotice && <Banner tone="notice">{userNotice}</Banner>}
 
       {usersLoading ? (
         <div className="flex justify-center py-8">
@@ -827,11 +890,7 @@ export default function SettingsPage() {
         title={editingUser ? "Edit User" : "Add New User"}
       >
         <div className="space-y-4">
-          {userError && (
-            <div className="rounded-lg bg-red-100 p-3 text-sm text-red-700">
-              {userError}
-            </div>
-          )}
+          {userError && <Banner tone="error">{userError}</Banner>}
 
           {/* Using each component's own label keeps every field the same height */}
           <Input
@@ -995,13 +1054,17 @@ export default function SettingsPage() {
   const handleDeleteFurnace = async (id: string) => {
     setFurnaceBusy(true);
     setFurnaceError(null);
+    setFurnaceNotice(null);
     try {
       const res = await fetch(`/api/furnaces?id=${id}`, { method: "DELETE" });
       const result = await res.json();
       if (result.success) {
-        // Furnaces already used by a batch come back deactivated, not deleted
-        if (result.message) setFurnaceError(result.message);
+        // Reload FIRST: it clears the error banner on success, which used to
+        // wipe this message a few milliseconds after it was set
         await loadFurnaces();
+        // A furnace already used by a batch comes back deactivated, not
+        // deleted. That is the outcome, not a failure - so it is a notice.
+        if (result.message) setFurnaceNotice(result.message);
       } else {
         setFurnaceError(result.error || "Failed to remove furnace");
       }
@@ -1023,11 +1086,8 @@ export default function SettingsPage() {
         </p>
       </div>
 
-      {furnaceError && (
-        <div className="rounded-lg bg-amber-100 p-3 text-sm text-amber-800">
-          {furnaceError}
-        </div>
-      )}
+      {furnaceError && <Banner tone="error">{furnaceError}</Banner>}
+      {furnaceNotice && <Banner tone="notice">{furnaceNotice}</Banner>}
 
       {/* Add */}
       <div className="flex items-end gap-3">
@@ -1236,12 +1296,14 @@ export default function SettingsPage() {
   const handleDeleteActivity = async (id: string) => {
     setActivityBusy(true);
     setActivityError(null);
+    setActivityNotice(null);
     try {
       const res = await fetch(`/api/activity-types?id=${id}`, { method: "DELETE" });
       const result = await res.json();
       if (result.success) {
-        if (result.message) setActivityError(result.message);
         await loadActivities();
+        // An operation with recorded entries is deactivated, not deleted
+        if (result.message) setActivityNotice(result.message);
       } else {
         setActivityError(result.error || "Failed to remove activity");
       }
@@ -1264,11 +1326,8 @@ export default function SettingsPage() {
         </p>
       </div>
 
-      {activityError && (
-        <div className="rounded-lg bg-amber-100 p-3 text-sm text-amber-800">
-          {activityError}
-        </div>
-      )}
+      {activityError && <Banner tone="error">{activityError}</Banner>}
+      {activityNotice && <Banner tone="notice">{activityNotice}</Banner>}
 
       <div className="flex items-end gap-3">
         <div className="flex-1">

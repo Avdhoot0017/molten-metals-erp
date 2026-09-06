@@ -30,6 +30,22 @@ through the app.
 > `npm run db:seed` is a different thing — it wipes the operational tables and
 > fills them with demo data. Local development only.
 
+## Day-to-day use on the shop-floor machine (Windows)
+
+Run once, after setting the machine up:
+
+```bat
+install-desktop-icon.bat
+```
+
+That puts a **Molten Metals ERP** icon on the Desktop. Double-clicking it
+starts the ERP and opens it in the browser - no terminal, no VS Code.
+
+The window it opens is the server log. **Closing that window stops the ERP.**
+
+If the app is already running, the icon just opens the browser rather than
+trying to start a second copy.
+
 ## Updating a running installation
 
 **macOS / Linux**
@@ -45,6 +61,10 @@ through the app.
 deploy                    :: pull, migrate, build, start
 deploy --no-start         :: stop after the build
 ```
+
+`deploy` fetches new code. `start.bat` (the desktop icon) does not - it only
+runs what is already there, so a shift can start the ERP without pulling an
+untested change onto the shop floor.
 
 `deploy.sh` needs bash. On Windows `deploy.bat` runs `update.mjs` instead,
 which does the same job in plain Node. Either way the build runs **before** the
