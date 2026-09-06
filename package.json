@@ -7,6 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "setup": "prisma migrate deploy && prisma generate && npx tsx prisma/setup.ts",
+    "db:setup": "npx tsx prisma/setup.ts",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
