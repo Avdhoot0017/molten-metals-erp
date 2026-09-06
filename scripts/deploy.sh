@@ -91,6 +91,12 @@ done
 cd "$REPO_ROOT"
 mkdir -p "$STATE_DIR"
 
+# The state directory ignores itself, so the script's own logs and pid file can
+# never make the working tree look dirty and block the next deploy. Doing it
+# here rather than relying on the repo .gitignore means it holds on a fresh
+# clone too, before anyone has committed anything.
+printf '*\n' > "$STATE_DIR/.gitignore"
+
 # Everything below is also appended to the deploy log, so a failed unattended
 # run can be read after the fact rather than reconstructed
 if (( ! DRY_RUN )); then
