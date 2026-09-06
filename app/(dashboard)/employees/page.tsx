@@ -19,6 +19,7 @@ import { Badge } from "@/components/ui/badge";
 import { Modal, ModalFooter } from "@/components/ui/modal";
 import { StatCard } from "@/components/ui/stat-card";
 import { formatDate } from "@/lib/utils";
+import { canWrite, canReassignEmployeeTask } from "@/lib/permissions";
 import type { ActivityType, Employee, UserRole } from "@/types";
 
 const emptyForm = {
@@ -47,10 +48,11 @@ export default function EmployeesPage() {
   const [newTask, setNewTask] = React.useState("");
   const [activityTypes, setActivityTypes] = React.useState<ActivityType[]>([]);
 
-  // Admin and plant head onboard employees; the fettling manager only moves
-  // them between operations.
-  const canManage = role === "ADMIN" || role === "PRODUCTION_MANAGER";
-  const canReassign = canManage || role === "FETTLING_MANAGER";
+  // Read from the permission matrix rather than listing roles here. A
+  // hard-coded list drifts from lib/permissions.ts the moment a role changes,
+  // and then the button and the API disagree about who may do what.
+  const canManage = role ? canWrite({ role }, "employees") : false;
+  const canReassign = role ? canReassignEmployeeTask({ role }) : false;
 
   const fetchData = React.useCallback(async () => {
     try {

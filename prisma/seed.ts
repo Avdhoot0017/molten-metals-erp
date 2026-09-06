@@ -1014,14 +1014,36 @@ async function main() {
       // rejected columns have something realistic in them
       const partsRejected = Math.floor((partsCompleted * ((d % 5) + 1)) / 100);
 
+      // A shift covers more than one part, so most days get two lines. The
+      // day's totals are the sum of them.
+      const index = employees.indexOf(employee);
+      const firstPart = parts[(d + index) % parts.length];
+      const secondPart = parts[(d + index + 1) % parts.length];
+      const splitAt = Math.max(1, Math.round(partsCompleted * 0.6));
+      const lines =
+        partsCompleted > 1 && firstPart.id !== secondPart.id
+          ? [
+              {
+                partId: firstPart.id,
+                partsCompleted: splitAt,
+                partsRejected: Math.min(partsRejected, splitAt),
+              },
+              {
+                partId: secondPart.id,
+                partsCompleted: partsCompleted - splitAt,
+                partsRejected: Math.max(0, partsRejected - splitAt),
+              },
+            ]
+          : [{ partId: firstPart.id, partsCompleted, partsRejected }];
+
       await prisma.fettlingActivity.create({
         data: {
           employeeId: employee.id,
           activityTypeId: employee.activityTypeId,
           date,
-          partId: parts[(d + employees.indexOf(employee)) % parts.length].id,
-          partsCompleted,
-          partsRejected,
+          partsCompleted: lines.reduce((sum, l) => sum + l.partsCompleted, 0),
+          partsRejected: lines.reduce((sum, l) => sum + l.partsRejected, 0),
+          items: { create: lines },
           recordedBy: fettlingManager.id,
         },
       });

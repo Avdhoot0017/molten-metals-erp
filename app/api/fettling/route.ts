@@ -9,6 +9,77 @@ import {
 } from "@/lib/fettling";
 import { Prisma } from "@prisma/client";
 
+export interface NormalisedItem {
+  partId: string;
+  partsCompleted: number;
+  partsRejected: number;
+}
+
+/**
+ * Validates the part lines of a day's work and rolls them up.
+ *
+ * An employee handles several parts in a shift, so the figures are per part
+ * and the day's totals are their sum - stored rather than recomputed on every
+ * read, because the dashboard aggregates these across months.
+ */
+export async function normaliseItems(
+  raw: unknown
+): Promise<
+  | { ok: true; items: NormalisedItem[]; completed: number; rejected: number }
+  | { ok: false; error: string }
+> {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return { ok: false, error: "Add at least one part" };
+  }
+
+  const items: NormalisedItem[] = [];
+  const seen = new Set<string>();
+
+  for (const line of raw) {
+    if (!line?.partId) return { ok: false, error: "Every line needs a part" };
+    if (seen.has(line.partId)) {
+      return { ok: false, error: "The same part is listed more than once" };
+    }
+    seen.add(line.partId);
+
+    const done = Number(line.partsCompleted);
+    if (!Number.isInteger(done) || done < 0) {
+      return { ok: false, error: "Parts done must be a whole number of 0 or more" };
+    }
+
+    // Blank means none were rejected - the common case, not an error
+    const rejected =
+      line.partsRejected === null ||
+      line.partsRejected === undefined ||
+      line.partsRejected === ""
+        ? 0
+        : Number(line.partsRejected);
+    if (!Number.isInteger(rejected) || rejected < 0) {
+      return { ok: false, error: "Rejected parts must be a whole number of 0 or more" };
+    }
+    if (rejected > done) {
+      return { ok: false, error: "Rejected parts cannot exceed parts done" };
+    }
+
+    items.push({ partId: line.partId, partsCompleted: done, partsRejected: rejected });
+  }
+
+  const known = await prisma.part.findMany({
+    where: { id: { in: items.map((i) => i.partId) } },
+    select: { id: true },
+  });
+  if (known.length !== items.length) {
+    return { ok: false, error: "Part not found" };
+  }
+
+  return {
+    ok: true,
+    items,
+    completed: items.reduce((sum, i) => sum + i.partsCompleted, 0),
+    rejected: items.reduce((sum, i) => sum + i.partsRejected, 0),
+  };
+}
+
 /** Activity types are rows now, so validity is a lookup rather than an enum. */
 async function activityTypeExists(id: string): Promise<boolean> {
   const type = await prisma.activityType.findUnique({ where: { id } });
@@ -57,7 +128,9 @@ const { searchParams } = new URL(request.url);
       include: {
         employee: { select: { id: true, name: true, employeeCode: true } },
         activityType: { select: { id: true, name: true } },
-        part: { select: { id: true, name: true, partCode: true } },
+        items: {
+          include: { part: { select: { id: true, name: true, partCode: true } } },
+        },
         user: { select: { name: true } },
       },
     });
@@ -160,7 +233,7 @@ if (!canRecordFettlingActivity(session)) {
     }
 
     const body = await request.json();
-    const { employeeId, activityTypeId: bodyActivityTypeId, date, partId, partsCompleted, partsRejected, notes } = body;
+    const { employeeId, activityTypeId: bodyActivityTypeId, date, items, notes } = body;
 
     if (!employeeId || !bodyActivityTypeId || !date) {
       return NextResponse.json(
@@ -188,30 +261,9 @@ if (!canRecordFettlingActivity(session)) {
       return NextResponse.json({ error: SHEET_LOCKED_MESSAGE }, { status: 403 });
     }
 
-    const count = Number(partsCompleted);
-    if (!Number.isInteger(count) || count < 0) {
-      return NextResponse.json(
-        { error: "Parts completed must be a whole number of 0 or more" },
-        { status: 400 }
-      );
-    }
-
-    // Blank means none were rejected - the common case, not an error
-    const rejected =
-      partsRejected === null || partsRejected === undefined || partsRejected === ""
-        ? 0
-        : Number(partsRejected);
-    if (!Number.isInteger(rejected) || rejected < 0) {
-      return NextResponse.json(
-        { error: "Rejected parts must be a whole number of 0 or more" },
-        { status: 400 }
-      );
-    }
-    if (rejected > count) {
-      return NextResponse.json(
-        { error: "Rejected parts cannot exceed parts done" },
-        { status: 400 }
-      );
+    const parsed = await normaliseItems(items);
+    if (!parsed.ok) {
+      return NextResponse.json({ error: parsed.error }, { status: 400 });
     }
 
     const employee = await prisma.employee.findUnique({ where: { id: employeeId } });
@@ -225,11 +277,18 @@ if (!canRecordFettlingActivity(session)) {
       );
     }
 
-    if (partId) {
-      const part = await prisma.part.findUnique({ where: { id: partId } });
-      if (!part) {
-        return NextResponse.json({ error: "Part not found" }, { status: 404 });
-      }
+    // One record per employee per day, so a second entry for the same day is a
+    // correction of the first rather than a new row
+    const clash = await prisma.fettlingActivity.findUnique({
+      where: { employeeId_date: { employeeId, date: workDate } },
+    });
+    if (clash) {
+      return NextResponse.json(
+        {
+          error: `${employee.name} already has an entry for this day - open it and edit instead`,
+        },
+        { status: 409 }
+      );
     }
 
     const activity = await prisma.fettlingActivity.create({
@@ -237,16 +296,18 @@ if (!canRecordFettlingActivity(session)) {
         employeeId,
         activityTypeId: bodyActivityTypeId,
         date: workDate,
-        partId: partId || null,
-        partsCompleted: count,
-        partsRejected: rejected,
+        partsCompleted: parsed.completed,
+        partsRejected: parsed.rejected,
+        items: { create: parsed.items },
         notes: notes?.trim() || null,
         recordedBy: session.id,
       },
       include: {
         employee: { select: { id: true, name: true, employeeCode: true } },
         activityType: { select: { id: true, name: true } },
-        part: { select: { id: true, name: true, partCode: true } },
+        items: {
+          include: { part: { select: { id: true, name: true, partCode: true } } },
+        },
         user: { select: { name: true } },
       },
     });
@@ -283,7 +344,7 @@ if (!canRecordFettlingActivity(session)) {
     }
 
     const body = await request.json();
-    const { id, activityTypeId: putActivityTypeId, date, partId, partsCompleted, partsRejected, notes } = body;
+    const { id, activityTypeId: putActivityTypeId, date, items, notes } = body;
 
     if (!id) {
       return NextResponse.json({ error: "Activity ID is required" }, { status: 400 });
@@ -306,14 +367,14 @@ if (!canRecordFettlingActivity(session)) {
 
     let workDate: Date | undefined;
     if (date !== undefined) {
-      const parsed = parseDateOnly(String(date));
-      if (!parsed) {
+      const parsedDate = parseDateOnly(String(date));
+      if (!parsedDate) {
         return NextResponse.json(
           { error: "Date must be in YYYY-MM-DD format" },
           { status: 400 }
         );
       }
-      workDate = parsed;
+      workDate = parsedDate;
     }
 
     // Both the day being amended and the day it would move to must be editable
@@ -324,37 +385,15 @@ if (!canRecordFettlingActivity(session)) {
       return NextResponse.json({ error: SHEET_LOCKED_MESSAGE }, { status: 403 });
     }
 
-    let count: number | undefined;
-    if (partsCompleted !== undefined) {
-      count = Number(partsCompleted);
-      if (!Number.isInteger(count) || count < 0) {
-        return NextResponse.json(
-          { error: "Parts completed must be a whole number of 0 or more" },
-          { status: 400 }
-        );
+    // The lines are replaced wholesale when they are sent. Patching them
+    // individually would need a per-line id in the payload for no gain - the
+    // form always holds the whole day's work anyway.
+    let parsed: Awaited<ReturnType<typeof normaliseItems>> | null = null;
+    if (items !== undefined) {
+      parsed = await normaliseItems(items);
+      if (!parsed.ok) {
+        return NextResponse.json({ error: parsed.error }, { status: 400 });
       }
-    }
-
-    let rejected: number | undefined;
-    if (partsRejected !== undefined) {
-      rejected = partsRejected === null || partsRejected === "" ? 0 : Number(partsRejected);
-      if (!Number.isInteger(rejected) || rejected < 0) {
-        return NextResponse.json(
-          { error: "Rejected parts must be a whole number of 0 or more" },
-          { status: 400 }
-        );
-      }
-    }
-
-    // Either figure may be the one being amended, so the check is against
-    // whichever value will actually be stored
-    const finalCount = count ?? existing.partsCompleted;
-    const finalRejected = rejected ?? existing.partsRejected;
-    if (finalRejected > finalCount) {
-      return NextResponse.json(
-        { error: "Rejected parts cannot exceed parts done" },
-        { status: 400 }
-      );
     }
 
     const updated = await prisma.fettlingActivity.update({
@@ -362,15 +401,21 @@ if (!canRecordFettlingActivity(session)) {
       data: {
         ...(putActivityTypeId !== undefined ? { activityTypeId: putActivityTypeId } : {}),
         ...(workDate !== undefined ? { date: workDate } : {}),
-        ...(partId !== undefined ? { partId: partId || null } : {}),
-        ...(count !== undefined ? { partsCompleted: count } : {}),
-        ...(rejected !== undefined ? { partsRejected: rejected } : {}),
+        ...(parsed?.ok
+          ? {
+              partsCompleted: parsed.completed,
+              partsRejected: parsed.rejected,
+              items: { deleteMany: {}, create: parsed.items },
+            }
+          : {}),
         ...(notes !== undefined ? { notes: notes?.trim() || null } : {}),
       },
       include: {
         employee: { select: { id: true, name: true, employeeCode: true } },
         activityType: { select: { id: true, name: true } },
-        part: { select: { id: true, name: true, partCode: true } },
+        items: {
+          include: { part: { select: { id: true, name: true, partCode: true } } },
+        },
         user: { select: { name: true } },
       },
     });

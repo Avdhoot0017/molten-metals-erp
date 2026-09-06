@@ -65,13 +65,13 @@ export const PERMISSIONS: Record<UserRole, Record<Resource, Access>> = {
   // scrap in and out as it works.
   FETTLING_MANAGER: {
     dashboard: READ,
-    // May view employees and move them between operations, but not add or
-    // remove them - see canReassignEmployeeTask below.
-    employees: READ,
+    // Runs the shop floor, so it hires and manages the people on it.
+    employees: WRITE,
     fettling: WRITE,
     inventory: WRITE,
     production: WRITE,
-    parts: READ,
+    // The shop floor defines the parts it fettles
+    parts: WRITE,
     companies: NONE,
     purchaseOrders: NONE,
     suppliers: NONE,

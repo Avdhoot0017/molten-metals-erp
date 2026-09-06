@@ -96,7 +96,7 @@ model Part {
   // Relations
   productionItems    ProductionItem[]
   dispatches         DispatchItem[]
-  fettlingActivities FettlingActivity[]
+  fettlingActivities FettlingActivityItem[]
 
   @@map("parts")
 }
@@ -142,16 +142,18 @@ model Employee {
 }
 
 // One day's recorded output for one employee on one operation.
-// Multiple rows per employee per day are allowed (different operations or parts).
+//
+// An employee works several parts in a shift, so the per-part figures live in
+// FettlingActivityItem and this holds the day's totals - the same parent/child
+// shape production batches use. The totals are stored rather than summed on
+// every read because the dashboard and analytics aggregate across months.
 model FettlingActivity {
   id             String   @id @default(cuid())
   employeeId     String
   activityTypeId String
   date           DateTime @db.Date // the working day this output belongs to
-  partId         String?
-  // Parts the employee handled that day, and how many of those failed
-  // inspection. Accepted is the difference, derived rather than stored so the
-  // two figures can never contradict each other.
+  // Totals across the items below. Accepted is the difference, derived rather
+  // than stored so the two figures can never contradict each other.
   partsCompleted Int
   partsRejected  Int      @default(0)
   notes          String?
@@ -161,14 +163,32 @@ model FettlingActivity {
 
   employee     Employee     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
   activityType ActivityType @relation(fields: [activityTypeId], references: [id])
-  part         Part?        @relation(fields: [partId], references: [id])
   user         User         @relation(fields: [recordedBy], references: [id])
+  items        FettlingActivityItem[]
 
-  // One sheet row per employee per day - the daily entry sheet upserts on this
+  // One record per employee per day - the day's work, broken down by part
   @@unique([employeeId, date])
   @@index([date])
   @@index([activityTypeId])
   @@map("fettling_activities")
+}
+
+// One part within a day's fettling work.
+model FettlingActivityItem {
+  id             String @id @default(cuid())
+  activityId     String
+  partId         String
+  partsCompleted Int
+  partsRejected  Int    @default(0)
+
+  activity FettlingActivity @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  part     Part             @relation(fields: [partId], references: [id])
+
+  // A part appears once per day's record; a second entry would be ambiguous
+  @@unique([activityId, partId])
+  @@index([activityId])
+  @@index([partId])
+  @@map("fettling_activity_items")
 }
 
 // Plant-wide settings, edited in Settings > System.

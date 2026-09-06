@@ -20,6 +20,8 @@ import { LoadingSpinner } from "@/components/ui/loading";
 import { formatWeight, formatDate } from "@/lib/utils";
 import { Pagination, type PaginationMeta } from "@/components/ui/pagination";
 import { parseWeightInput, weightToInput, WEIGHT_UNIT } from "@/lib/units";
+import { canWrite } from "@/lib/permissions";
+import type { UserRole } from "@/types";
 
 interface Part {
   id: string;
@@ -40,6 +42,14 @@ export default function PartsPage() {
   const [pagination, setPagination] = React.useState<PaginationMeta | null>(null);
   const [isAddModalOpen, setIsAddModalOpen] = React.useState(false);
   const [isEditModalOpen, setIsEditModalOpen] = React.useState(false);
+  /**
+   * Who may change parts, read from the permission matrix rather than a role
+   * list here. The page previously offered Add, Edit and Delete to everyone,
+   * including the read-only Accounts role, so the buttons were there but the
+   * API answered 403 - a control that cannot work is worse than no control.
+   */
+  const [role, setRole] = React.useState<UserRole | null>(null);
+  const canManage = role ? canWrite({ role }, "parts") : false;
   const [isDeleteModalOpen, setIsDeleteModalOpen] = React.useState(false);
   const [selectedPart, setSelectedPart] = React.useState<Part | null>(null);
   const [isLoading, setIsLoading] = React.useState(false);
@@ -134,6 +144,19 @@ export default function PartsPage() {
     }
   };
 
+  React.useEffect(() => {
+    void (async () => {
+      try {
+        const res = await fetch("/api/auth/session");
+        const data = await res.json();
+        if (data.success) setRole(data.user.role);
+      } catch {
+        // Only decides which buttons are offered; the API decides what is
+        // actually allowed
+      }
+    })();
+  }, []);
+
   const handleEditPart = async () => {
     if (!selectedPart) return;
     setIsLoading(true);
@@ -220,10 +243,12 @@ export default function PartsPage() {
             <RefreshCw className="h-4 w-4 mr-2" />
             Refresh
           </Button>
-          <Button onClick={() => setIsAddModalOpen(true)}>
-            <Plus className="h-4 w-4 mr-2" />
-            Add Part
-          </Button>
+          {canManage && (
+            <Button onClick={() => setIsAddModalOpen(true)}>
+              <Plus className="h-4 w-4 mr-2" />
+              Add Part
+            </Button>
+          )}
         </div>
       </div>
 
@@ -305,12 +330,18 @@ export default function PartsPage() {
             <EmptyState
               icon={Boxes}
               title="No parts found"
-              description="Add your first part to get started with production tracking."
+              description={
+                canManage
+                  ? "Add your first part to get started with production tracking."
+                  : "No parts have been added yet. Someone with parts access can add them."
+              }
               action={
-                <Button onClick={() => setIsAddModalOpen(true)}>
-                  <Plus className="h-4 w-4 mr-2" />
-                  Add Part
-                </Button>
+                canManage ? (
+                  <Button onClick={() => setIsAddModalOpen(true)}>
+                    <Plus className="h-4 w-4 mr-2" />
+                    Add Part
+                  </Button>
+                ) : undefined
               }
             />
           ) : (
@@ -376,23 +407,33 @@ export default function PartsPage() {
                       </td>
                       <td className="py-3 px-4">
                         <div className="flex items-center gap-2">
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            onClick={() => openEditModal(part)}
-                          >
-                            <Edit className="h-4 w-4" />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            onClick={() => {
-                              setSelectedPart(part);
-                              setIsDeleteModalOpen(true);
-                            }}
-                          >
-                            <Trash2 className="h-4 w-4 text-[var(--error)]" />
-                          </Button>
+                          {canManage ? (
+                            <>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                title="Edit this part"
+                                onClick={() => openEditModal(part)}
+                              >
+                                <Edit className="h-4 w-4" />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                title="Remove this part"
+                                onClick={() => {
+                                  setSelectedPart(part);
+                                  setIsDeleteModalOpen(true);
+                                }}
+                              >
+                                <Trash2 className="h-4 w-4 text-[var(--error)]" />
+                              </Button>
+                            </>
+                          ) : (
+                            <span className="text-sm text-[var(--muted-foreground)]">
+                              &mdash;
+                            </span>
+                          )}
                         </div>
                       </td>
                     </tr>
