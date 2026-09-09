@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { ALL_MATERIAL_TYPES } from "@/lib/ingot";
+import { ALL_MATERIAL_TYPES, isScrapType } from "@/lib/ingot";
 import prisma from "@/lib/prisma";
 import { getSession } from "@/lib/auth";
-import { canRead, canWrite } from "@/lib/permissions";
+import { canRead, canWrite, canAdjustScrapStock } from "@/lib/permissions";
 import { parsePagination, buildPaginationMeta } from "@/lib/pagination";
 import { AluminumType, Prisma } from "@prisma/client";
 
@@ -99,6 +99,17 @@ const body = await request.json();
     const validTypes: AluminumType[] = ALL_MATERIAL_TYPES;
     if (!validTypes.includes(type)) {
       return NextResponse.json({ error: "Invalid inventory type" }, { status: 400 });
+    }
+
+    // Scrap moves through production - a heat makes it, another re-melts it -
+    // so booking it by hand is a stock-take correction, and that sits with the
+    // admin. Ingot is bought in and issued, so anyone running the plant books
+    // that themselves.
+    if (isScrapType(type) && !canAdjustScrapStock(session)) {
+      return NextResponse.json(
+        { error: "Only an admin can add or remove scrap stock" },
+        { status: 403 }
+      );
     }
 
     if (!["ADD", "REMOVE", "ADJUST"].includes(action)) {

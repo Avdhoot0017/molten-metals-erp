@@ -136,6 +136,18 @@ export function canAmendCompletedBatch(user: RoleHolder | null | undefined) {
   return user?.role === "ADMIN";
 }
 
+/**
+ * Only an admin may add or remove SCRAP stock by hand.
+ *
+ * Scrap arrives and leaves through production - a heat generates it, another
+ * re-melts it - so a hand adjustment is either a stock-take correction or a
+ * mistake. Ingot is different: it is bought in and issued, so anyone who runs
+ * the plant needs to book it.
+ */
+export function canAdjustScrapStock(user: RoleHolder | null | undefined) {
+  return user?.role === "ADMIN";
+}
+
 export function canReassignEmployeeTask(user: RoleHolder | null | undefined) {
   if (!user) return false;
   return canWrite(user, "employees") || user.role === "FETTLING_MANAGER";

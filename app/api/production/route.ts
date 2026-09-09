@@ -4,7 +4,8 @@ import { formatWeight } from "@/lib/units";
 import { getSession } from "@/lib/auth";
 import { canRead, canWrite } from "@/lib/permissions";
 import { parsePagination, buildPaginationMeta } from "@/lib/pagination";
-import { materialType } from "@/lib/ingot";
+import { materialType, isIngotType, gradeName } from "@/lib/ingot";
+import type { AluminumType } from "@/types";
 import {
   MAX_OPEN_BATCHES_PER_FURNACE,
   batchPrefix,
@@ -199,6 +200,10 @@ const body = await request.json();
     // when the furnace is charged, so they are added later through PATCH.
     const {
       furnaceId,
+      // The alloy this heat runs on, sent explicitly. It cannot always be
+      // inferred from the weights: a heat charged entirely with re-melted
+      // scrap has no ingot to read a grade from.
+      ingotGrade,
       aluminumUsedLM6,
       aluminumUsedLM9,
       aluminumUsedLM25,
@@ -227,22 +232,19 @@ const body = await request.json();
 
     const aluminumUsedNum = ingotCharge.reduce((sum, i) => sum + i.amount, 0);
 
-    if (aluminumUsedNum <= 0) {
-      return NextResponse.json(
-        // The form charges one grade per batch, but the API still accepts a
-        // split, so the message stays grade-neutral
-        { error: "Enter the weight of aluminium used" },
-        { status: 400 }
-      );
-    }
-
-    // A heat runs on one alloy. The grade with the most metal in it is the
-    // batch grade, which then governs every scrap movement below - what may be
-    // re-melted into the heat, and what grade the scrap coming off it becomes.
-    const batchGrade = ingotCharge.reduce((best, i) =>
-      i.amount > best.amount ? i : best
-    ).grade;
-    const batchIngotType = materialType("INGOT", batchGrade);
+    // A heat runs on one alloy, and that grade governs every scrap movement
+    // below - what may be re-melted in, and what grade the scrap coming off it
+    // becomes. Taken from the caller when given; otherwise from whichever
+    // grade holds the most metal, which is how older callers expressed it.
+    const batchIngotType =
+      typeof ingotGrade === "string" && isIngotType(ingotGrade as AluminumType)
+        ? (ingotGrade as AluminumType)
+        : materialType(
+            "INGOT",
+            ingotCharge.reduce((best, i) => (i.amount > best.amount ? i : best))
+              .grade
+          );
+    const batchGrade = gradeName(batchIngotType);
 
     if (!furnaceId) {
       return NextResponse.json(
@@ -308,6 +310,16 @@ const body = await request.json();
     }
 
     const totalScrapUsedNum = scrapUsed.reduce((sum, s) => sum + s.amount, 0);
+
+    // Something has to go into the furnace, but it does not have to be fresh
+    // ingot - a heat run entirely on re-melted scrap is ordinary foundry work.
+    // So the requirement is on the CHARGE, not on the ingot alone.
+    if (aluminumUsedNum + totalScrapUsedNum <= 0) {
+      return NextResponse.json(
+        { error: "Enter the ingot or the scrap charged into this heat" },
+        { status: 400 }
+      );
+    }
 
     // Each grade is its own stock line, so each is checked on its own
     for (const ingot of ingotCharge) {

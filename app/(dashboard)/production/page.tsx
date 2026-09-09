@@ -648,8 +648,12 @@ export default function ProductionPage() {
       );
       return;
     }
-    if (ingotChargeTotal <= 0) {
-      setError(`Enter the weight of ${selectedGrade.grade} aluminium used`);
+    // Either will do: a heat can run on fresh ingot, on re-melted scrap, or
+    // on both. What it cannot be is empty.
+    if (totalCharge <= 0) {
+      setError(
+        `Enter the ${selectedGrade.grade} ingot or scrap charged into this heat`
+      );
       return;
     }
     if (stockKnown && ingotChargeTotal > selectedGradeStock) {
@@ -678,6 +682,9 @@ export default function ProductionPage() {
 
     await submitBatch("/api/production", "POST", {
       furnaceId: formData.furnaceId,
+      // Sent explicitly: with no ingot at all there is nothing for the server
+      // to infer the alloy from
+      ingotGrade: formData.ingotGrade,
       // The batch is charged with one grade; the other two go over as 0
       aluminumUsedLM6:
         formData.ingotGrade === "INGOT_LM6" ? ingotChargeTotal : 0,
@@ -914,8 +921,8 @@ export default function ProductionPage() {
         return;
       }
     }
-    if (ingotChargeTotal <= 0) {
-      setError("Enter the weight of aluminium used");
+    if (totalCharge <= 0) {
+      setError("Enter the ingot or the scrap charged into this heat");
       return;
     }
     for (const element of LM6_ELEMENTS) {
@@ -932,6 +939,7 @@ export default function ProductionPage() {
     await submitBatch(`/api/production/${editingRecord.id}`, "PATCH", {
       stage: "amend",
       furnaceId: formData.furnaceId,
+      ingotGrade: formData.ingotGrade,
       aluminumUsedLM6:
         formData.ingotGrade === "INGOT_LM6" ? ingotChargeTotal : 0,
       aluminumUsedLM9:
@@ -1518,8 +1526,8 @@ export default function ProductionPage() {
               Aluminium Used ({WEIGHT_UNIT})
             </h4>
             <p className="mb-3 text-sm text-[var(--muted-foreground)]">
-              Pick the grade this heat was charged with, then enter the weight
-              taken from it.
+              Pick the grade this heat was charged with, then enter what went
+              in. Fresh ingot, re-melted scrap, or both &mdash; at least one.
             </p>
 
             {/* Grade tabs - one at a time */}
@@ -1596,14 +1604,14 @@ export default function ProductionPage() {
                 // be left. The operator is deciding how much to charge, and
                 // that decision is about the remainder, not the total.
                 !stockKnown
-                  ? "Weight of ingot charged into this heat"
+                  ? "Fresh ingot charged into this heat. Optional if scrap is used."
                   : ingotChargeTotal > selectedGradeStock
                   ? undefined
                   : ingotChargeTotal > 0
                   ? `${formatWeight(selectedGradeStock)} available · ${formatWeight(
                       selectedGradeStock - ingotChargeTotal
                     )} left after this heat`
-                  : `${formatWeight(selectedGradeStock)} of ${selectedGrade.grade} available`
+                  : `${formatWeight(selectedGradeStock)} of ${selectedGrade.grade} available. Optional if scrap is used.`
               }
               onChange={(e) =>
                 setFormData({ ...formData, aluminumUsed: e.target.value })
@@ -1958,9 +1966,10 @@ export default function ProductionPage() {
               </span>
             ) : batchModal === "create" ? (
               <span className="text-[var(--muted-foreground)]">
-                {ingotChargeTotal > 0
-                  ? `Charging ${formatWeight(totalCharge)} of ${selectedGrade.grade}`
-                  : "Enter the metal charged into the furnace"}
+                {totalCharge > 0
+                  ? `Charging ${formatWeight(totalCharge)} of ${selectedGrade.grade}` +
+                    (ingotChargeTotal === 0 ? " - all re-melted scrap" : "")
+                  : "Enter the ingot or scrap charged into the furnace"}
               </span>
             ) : batchModal === "melt" ? (
               <span className="text-[var(--muted-foreground)]">

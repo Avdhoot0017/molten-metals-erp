@@ -8,7 +8,13 @@ import {
   validateDensityPair,
 } from "@/lib/density-index";
 import { parseComposition } from "@/lib/composition";
-import { materialType, gradeName, GRADE_NAMES, SCRAP_FORMS } from "@/lib/ingot";
+import {
+  materialType,
+  gradeName,
+  isIngotType,
+  GRADE_NAMES,
+  SCRAP_FORMS,
+} from "@/lib/ingot";
 import type { AluminumType } from "@/types";
 import { Prisma } from "@prisma/client";
 
@@ -226,18 +232,19 @@ async function parseCharge(body: Record<string, unknown>, currentFurnaceId: stri
   }
 
   const aluminumUsedNum = ingotCharge.reduce((sum, i) => sum + i.amount, 0);
-  if (aluminumUsedNum <= 0) {
-    return {
-      error: NextResponse.json(
-        { error: "Enter the weight of aluminium used" },
-        { status: 400 }
-      ),
-    };
-  }
 
-  const batchGrade = ingotCharge.reduce((best, i) =>
-    i.amount > best.amount ? i : best
-  ).grade;
+  // Taken from the caller when given, because a heat charged entirely with
+  // re-melted scrap has no ingot to read a grade from
+  const batchIngotType =
+    typeof body.ingotGrade === "string" &&
+    isIngotType(body.ingotGrade as AluminumType)
+      ? (body.ingotGrade as AluminumType)
+      : materialType(
+          "INGOT",
+          ingotCharge.reduce((best, i) => (i.amount > best.amount ? i : best))
+            .grade
+        );
+  const batchGrade = gradeName(batchIngotType);
 
   const scrapUsed = [
     { form: "RUNNER_RAISER" as const, label: "Runner & Raiser", amount: Number(body.runnerRaiserScrapUsed) || 0 },
@@ -255,14 +262,27 @@ async function parseCharge(body: Record<string, unknown>, currentFurnaceId: stri
     }
   }
 
+  const totalScrapUsedNum = scrapUsed.reduce((sum, s) => sum + s.amount, 0);
+
+  // Something has to go into the furnace, but it does not have to be fresh
+  // ingot - a heat run entirely on re-melted scrap is ordinary foundry work.
+  if (aluminumUsedNum + totalScrapUsedNum <= 0) {
+    return {
+      error: NextResponse.json(
+        { error: "Enter the ingot or the scrap charged into this heat" },
+        { status: 400 }
+      ),
+    };
+  }
+
   return {
     furnaceId,
     ingotCharge,
     aluminumUsedNum,
     batchGrade,
-    batchIngotType: materialType("INGOT", batchGrade),
+    batchIngotType,
     scrapUsed,
-    totalScrapUsedNum: scrapUsed.reduce((sum, s) => sum + s.amount, 0),
+    totalScrapUsedNum,
   };
 }
 
@@ -840,4 +860,110 @@ async function completeBatch(
   });
 
   return NextResponse.json({ success: true, data: result });
+}
+
+/**
+ * DELETE - remove a batch and put back the metal it moved.
+ *
+ * Admin only, for the same reason amending is: this reverses stock movements
+ * that have already been booked, which is a correction rather than routine
+ * work.
+ *
+ * The batch's original inventory log entries are LEFT IN PLACE and reversing
+ * entries are written alongside them. Deleting them would make the stock
+ * figures unexplainable - the metal would move with nothing in the history
+ * saying why. The reversal notes name the batch, so the pair reads as what it
+ * is: booked, then undone.
+ */
+export async function DELETE(
+  request: NextRequest,
+  ctx: RouteContext<"/api/production/[id]">
+) {
+  try {
+    const session = await getSession();
+    if (!session) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+    if (!canAmendCompletedBatch(session)) {
+      return NextResponse.json(
+        { error: "Only an admin can delete a production batch" },
+        { status: 403 }
+      );
+    }
+
+    const { id } = await ctx.params;
+    const record = await prisma.productionRecord.findUnique({
+      where: { id },
+      include: { items: true },
+    });
+    if (!record) {
+      return NextResponse.json({ error: "Batch not found" }, { status: 404 });
+    }
+
+    // Undo exactly what this batch did: the reverse of its own movements
+    const moves = batchMovements(record);
+    const reversals = new Map<AluminumType, number>();
+    for (const [type, amount] of moves) {
+      if (amount !== 0) reversals.set(type, -amount);
+    }
+
+    // Metal this batch generated may already have gone into another heat, so
+    // taking it back out could leave a line short. Checked before anything is
+    // written rather than failing halfway.
+    for (const [type, delta] of reversals) {
+      if (delta >= 0) continue;
+      const stock = await prisma.inventory.findUnique({ where: { type } });
+      const available = stock?.quantity ?? 0;
+      if (available + delta < 0) {
+        return NextResponse.json(
+          {
+            error: `Deleting this batch would take ${type} below zero - it produced ${formatWeight(-delta)} but only ${formatWeight(available)} is left, so some has already been used.`,
+          },
+          { status: 400 }
+        );
+      }
+    }
+
+    await prisma.$transaction(async (tx) => {
+      for (const [type, delta] of reversals) {
+        const stock = await tx.inventory.findUnique({ where: { type } });
+        const prevQty = stock?.quantity ?? 0;
+
+        await tx.inventory.upsert({
+          where: { type },
+          update: { quantity: { increment: delta }, lastUpdated: new Date() },
+          create: { type, quantity: Math.max(0, delta) },
+        });
+
+        await tx.inventoryLog.create({
+          data: {
+            type,
+            action: "ADJUST",
+            quantity: delta,
+            previousQty: prevQty,
+            newQty: prevQty + delta,
+            reference: "Production",
+            referenceId: id,
+            notes: `Reversed - production batch ${record.batchNumber} was deleted`,
+            createdBy: session.id,
+          },
+        });
+      }
+
+      // The line items go with it; the log entries above deliberately do not
+      await tx.productionItem.deleteMany({ where: { productionRecordId: id } });
+      await tx.productionRecord.delete({ where: { id } });
+    });
+
+    return NextResponse.json({
+      success: true,
+      message: `Batch ${record.batchNumber} deleted and its metal returned to stock`,
+    });
+  } catch (error) {
+    console.error("Error deleting production record:", error);
+    return NextResponse.json(
+      { error: "Failed to delete production record" },
+      { status: 500 }
+    );
+  }
 }

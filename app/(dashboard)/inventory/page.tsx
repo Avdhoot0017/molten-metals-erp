@@ -31,6 +31,8 @@ import {
 } from "@/lib/ingot";
 import { parseWeightInput, weightForExport, WEIGHT_UNIT } from "@/lib/units";
 import { MaterialTypeSelect } from "@/components/inventory/material-type-select";
+import { canAdjustScrapStock } from "@/lib/permissions";
+import type { UserRole } from "@/types";
 import { Pagination, type PaginationMeta } from "@/components/ui/pagination";
 import {
   exportToExcel,
@@ -93,6 +95,13 @@ function typeMeta(type: AluminumType): {
 
 export default function InventoryPage() {
   const [inventory, setInventory] = React.useState<InventoryItem[]>([]);
+  /**
+   * Booking scrap by hand is an admin correction, so the scrap options are
+   * disabled for everyone else. Read from the matrix rather than a role list,
+   * and enforced again by the API - this only decides what is offered.
+   */
+  const [role, setRole] = React.useState<UserRole | null>(null);
+  const canScrap = role ? canAdjustScrapStock({ role }) : false;
   const [logs, setLogs] = React.useState<InventoryLog[]>([]);
   const [logPage, setLogPage] = React.useState(1);
   const [logPageSize, setLogPageSize] = React.useState(10);
@@ -152,6 +161,18 @@ export default function InventoryPage() {
       await fetchData();
     })();
   }, [fetchData]);
+
+  React.useEffect(() => {
+    void (async () => {
+      try {
+        const res = await fetch("/api/auth/session");
+        const data = await res.json();
+        if (data.success) setRole(data.user.role);
+      } catch {
+        // Falls back to scrap disabled, which is the safe direction
+      }
+    })();
+  }, []);
 
   const totalAluminum = inventory.reduce((sum, item) => sum + item.quantity, 0);
 
@@ -695,6 +716,7 @@ export default function InventoryPage() {
           <MaterialTypeSelect
             value={selectedType}
             onChange={setSelectedType}
+            canChooseScrap={canScrap}
           />
           <div>
             <Input
@@ -751,6 +773,7 @@ export default function InventoryPage() {
           <MaterialTypeSelect
             value={selectedType}
             onChange={setSelectedType}
+            canChooseScrap={canScrap}
           />
           <div>
             <Input

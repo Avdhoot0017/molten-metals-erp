@@ -15,6 +15,13 @@ interface MaterialTypeSelectProps {
   value: AluminumType;
   onChange: (type: AluminumType) => void;
   label?: string;
+  /**
+   * Whether the scrap forms may be chosen. Scrap normally moves through
+   * production, so booking it by hand is an admin correction - the options
+   * stay visible but disabled, because hiding them would leave people
+   * wondering where scrap went.
+   */
+  canChooseScrap?: boolean;
 }
 
 /**
@@ -29,6 +36,7 @@ export function MaterialTypeSelect({
   value,
   onChange,
   label = "Material Type",
+  canChooseScrap = true,
 }: MaterialTypeSelectProps) {
   const { form: selectedForm, grade: selectedGrade } = parseMaterialType(value);
 
@@ -87,17 +95,28 @@ export function MaterialTypeSelect({
             const type = materialType(f.form, selectedGrade);
             const active = value === type;
             const Icon = f.isScrap ? Recycle : Package;
+            const blocked = f.isScrap && !canChooseScrap;
 
             return (
               <button
                 key={f.form}
                 type="button"
+                disabled={blocked}
+                title={
+                  blocked
+                    ? "Only an admin can add or remove scrap stock"
+                    : undefined
+                }
                 onClick={() => onChange(type)}
                 className={cn(
-                  "cursor-pointer flex items-center gap-3 rounded-lg border-2 p-3 text-left transition-all",
+                  "flex items-center gap-3 rounded-lg border-2 p-3 text-left transition-all",
+                  blocked
+                    ? "cursor-not-allowed border-[var(--border)] opacity-50"
+                    : "cursor-pointer",
                   active
                     ? "border-[var(--primary)] bg-[var(--accent)]"
-                    : "border-[var(--border)] hover:border-[var(--primary)]/50 hover:bg-[var(--muted)]"
+                    : !blocked &&
+                        "border-[var(--border)] hover:border-[var(--primary)]/50 hover:bg-[var(--muted)]"
                 )}
               >
                 <Icon
@@ -113,7 +132,7 @@ export function MaterialTypeSelect({
                       and applies to every form in this list */}
                   <span className="block text-sm font-medium">{f.label}</span>
                   <span className="block text-xs text-[var(--muted-foreground)]">
-                    {f.description}
+                    {blocked ? "Only an admin can book this by hand" : f.description}
                   </span>
                 </span>
                 {active && (
