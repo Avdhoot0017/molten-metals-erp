@@ -597,20 +597,11 @@ export default function PartsPage() {
               onChange={(e) => setFormData({ ...formData, name: e.target.value })}
               className="h-12"
             />
-            <Input
-              label={`Weight per Piece (${WEIGHT_UNIT})`}
-              type="number"
-              placeholder="Finished casting weight"
-              value={formData.weightPerPiece}
-              onChange={(e) =>
-                setFormData({ ...formData, weightPerPiece: e.target.value })
-              }
-              className="h-12"
-            />
-            {/* The mould takes more metal than the casting keeps - runners,
-                risers and feeders are poured with it and cut off afterwards.
-                Recording both figures is what lets the expected scrap below be
-                worked out instead of guessed at. */}
+            {/* Poured first, then what is left. The mould takes more metal
+                than the casting keeps - runners, risers and feeders are poured
+                with it and cut off afterwards - so the two are asked for in the
+                order the metal actually goes through them, and the expected
+                scrap below falls out of the pair. */}
             <Input
               label={`Pouring Weight (${WEIGHT_UNIT})`}
               type="number"
@@ -618,6 +609,16 @@ export default function PartsPage() {
               value={formData.pouringWeight}
               onChange={(e) =>
                 setFormData({ ...formData, pouringWeight: e.target.value })
+              }
+              className="h-12"
+            />
+            <Input
+              label={`Weight per Piece (${WEIGHT_UNIT})`}
+              type="number"
+              placeholder="Finished casting weight"
+              value={formData.weightPerPiece}
+              onChange={(e) =>
+                setFormData({ ...formData, weightPerPiece: e.target.value })
               }
               className="h-12"
             />
@@ -728,20 +729,11 @@ export default function PartsPage() {
               onChange={(e) => setFormData({ ...formData, name: e.target.value })}
               className="h-12"
             />
-            <Input
-              label={`Weight per Piece (${WEIGHT_UNIT})`}
-              type="number"
-              placeholder="Finished casting weight"
-              value={formData.weightPerPiece}
-              onChange={(e) =>
-                setFormData({ ...formData, weightPerPiece: e.target.value })
-              }
-              className="h-12"
-            />
-            {/* The mould takes more metal than the casting keeps - runners,
-                risers and feeders are poured with it and cut off afterwards.
-                Recording both figures is what lets the expected scrap below be
-                worked out instead of guessed at. */}
+            {/* Poured first, then what is left. The mould takes more metal
+                than the casting keeps - runners, risers and feeders are poured
+                with it and cut off afterwards - so the two are asked for in the
+                order the metal actually goes through them, and the expected
+                scrap below falls out of the pair. */}
             <Input
               label={`Pouring Weight (${WEIGHT_UNIT})`}
               type="number"
@@ -749,6 +741,16 @@ export default function PartsPage() {
               value={formData.pouringWeight}
               onChange={(e) =>
                 setFormData({ ...formData, pouringWeight: e.target.value })
+              }
+              className="h-12"
+            />
+            <Input
+              label={`Weight per Piece (${WEIGHT_UNIT})`}
+              type="number"
+              placeholder="Finished casting weight"
+              value={formData.weightPerPiece}
+              onChange={(e) =>
+                setFormData({ ...formData, weightPerPiece: e.target.value })
               }
               className="h-12"
             />
