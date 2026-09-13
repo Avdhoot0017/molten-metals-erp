@@ -85,7 +85,10 @@ interface DashboardData {
     partCode: string;
     name: string;
     weightPerPiece: number;
-    expectedScrap: number;
+    /** Metal poured per casting; null where it has not been recorded. */
+    pouringWeight: number | null;
+    /** Gating per casting, derived from the weights; null when unknown. */
+    expectedScrap: number | null;
     batches: number;
     quantityProduced: number;
     goodParts: number;
@@ -94,6 +97,13 @@ interface DashboardData {
     totalScrap: number;
     avgEfficiency: number;
     rejectionRate: number;
+    alloyGrade: string;
+    /** Rejected at the furnace, and at the fettling bench. */
+    castingRejects: number;
+    fettlingRejects: number;
+    fettlingHandled: number;
+    /** What those rejects weigh, at this part's own weight per piece. */
+    rejectedWeight: number;
   }>;
   counts: {
     parts: number;
@@ -423,6 +433,7 @@ export default function DashboardPage() {
                       <th className="text-left py-3 px-4 font-semibold text-sm">Part Number</th>
                       <th className="text-left py-3 px-4 font-semibold text-sm">Part Name</th>
                       <th className="text-right py-3 px-4 font-semibold text-sm">Weight / pc</th>
+                      <th className="text-left py-3 px-4 font-semibold text-sm">Alloy</th>
                       <th className="text-right py-3 px-4 font-semibold text-sm">Batches</th>
                       <th className="text-right py-3 px-4 font-semibold text-sm">Produced</th>
                       <th className="text-right py-3 px-4 font-semibold text-sm">Good</th>
@@ -447,6 +458,7 @@ export default function DashboardPage() {
                         <td className="py-3 px-4 text-right text-sm">
                           {formatWeight(part.weightPerPiece)}
                         </td>
+                        <td className="py-3 px-4 text-sm">{part.alloyGrade}</td>
                         <td className="py-3 px-4 text-right text-sm">{part.batches}</td>
                         <td className="py-3 px-4 text-right font-medium">
                           {part.quantityProduced.toLocaleString("en-IN")}
@@ -458,9 +470,19 @@ export default function DashboardPage() {
                           <span className={part.rejectedParts > 0 ? "text-red-600" : ""}>
                             {part.rejectedParts.toLocaleString("en-IN")}
                           </span>
-                          {part.quantityProduced > 0 && (
+                          {part.rejectionRate > 0 && (
                             <span className="text-[var(--muted-foreground)] ml-1">
                               ({part.rejectionRate.toFixed(1)}%)
+                            </span>
+                          )}
+                          {/* Where it failed matters more than the total: at
+                              the furnace is a melt problem, at the bench is a
+                              finishing one */}
+                          {part.rejectedParts > 0 && (
+                            <span className="block text-xs text-[var(--muted-foreground)]">
+                              {part.castingRejects} casting &middot;{" "}
+                              {part.fettlingRejects} fettling &middot;{" "}
+                              {formatWeight(part.rejectedWeight)}
                             </span>
                           )}
                         </td>

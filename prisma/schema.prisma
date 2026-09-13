@@ -87,8 +87,36 @@ model Part {
   partCode       String   @unique
   name           String
   description    String?
-  weightPerPiece Float // Weight in grams
-  expectedScrap  Float    @default(0) // Expected scrap percentage
+  /** The finished casting, in grams - what the customer receives. */
+  weightPerPiece Float
+  /**
+   * Metal actually poured for one casting, in grams.
+   *
+   * More than the finished part: the gating system - runners, risers, feeders -
+   * is poured with it and cut off afterwards. The difference between the two is
+   * the expected scrap, so that figure is derived (see expectedScrapOf in
+   * lib/parts.ts) rather than stored - nothing can drift out of step with it.
+   *
+   * Nullable on purpose: a part recorded before pouring weights were tracked
+   * has no honest value here, and null says "not measured yet" where a 0 would
+   * claim the mould took exactly the casting's weight.
+   */
+  pouringWeight  Float?
+  // The alloy this part is cast in. A casting drawing specifies one, so it
+  // lives here rather than being asked for every time - it is what decides
+  // which scrap line a rejected casting is booked to.
+  alloyGrade     String   @default("LM6")
+  /**
+   * DEPRECATED - the old expected-scrap figure, a PERCENTAGE of the finished
+   * weight, typed in by hand.
+   *
+   * Superseded by pouringWeight, which gives the same thing in kg without
+   * anyone having to work it out. Kept, and still written by nothing, because
+   * it is the only record of what each part was set to before the change - it
+   * is read by no screen and can be dropped once nobody wants it back. The
+   * column keeps its old name in the database so no data has to move.
+   */
+  expectedScrapPercent Float @default(0) @map("expectedScrap")
   isActive       Boolean  @default(true)
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
@@ -180,6 +208,17 @@ model FettlingActivityItem {
   partId         String
   partsCompleted Int
   partsRejected  Int    @default(0)
+  /**
+   * What the rejected castings on this line actually weigh, in grams.
+   *
+   * Normally this is the count times the part's weight, and leaving it null
+   * says exactly that - use the calculation. It is here because the two are not
+   * always the same: a casting can be rejected as a part-filled pour, or broken
+   * up, or weighed on the bench scale before it goes in the bin. When a real
+   * weight is given it is what gets booked to scrap stock, because it is the
+   * better number.
+   */
+  rejectedWeight Float?
 
   activity FettlingActivity @relation(fields: [activityId], references: [id], onDelete: Cascade)
   part     Part             @relation(fields: [partId], references: [id])

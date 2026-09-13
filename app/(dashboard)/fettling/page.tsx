@@ -27,6 +27,12 @@ import { Modal, ModalFooter } from "@/components/ui/modal";
 import { StatCard } from "@/components/ui/stat-card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { formatDate } from "@/lib/utils";
+import {
+  parseWeightInput,
+  weightToInput,
+  formatWeight,
+  WEIGHT_UNIT,
+} from "@/lib/units";
 import { canWrite } from "@/lib/permissions";
 import type { ActivityType, UserRole } from "@/types";
 
@@ -34,6 +40,8 @@ interface PartRef {
   id: string;
   name: string;
   partCode: string;
+  /** Grams. Used to work out what rejects weigh when nobody weighed them. */
+  weightPerPiece: number;
 }
 
 interface ActivityItem {
@@ -41,6 +49,8 @@ interface ActivityItem {
   partId: string;
   partsCompleted: number;
   partsRejected: number;
+  /** Weighed scrap in grams; null where the calculation was left to stand. */
+  rejectedWeight: number | null;
   part: PartRef;
 }
 
@@ -77,6 +87,8 @@ interface DraftLine {
   partId: string;
   partsCompleted: string;
   partsRejected: string;
+  /** Weighed scrap in kg as typed. Blank means "use the calculation". */
+  rejectedWeight: string;
 }
 
 /** Today's date as YYYY-MM-DD in the browser's timezone. */
@@ -205,6 +217,8 @@ export default function FettlingPage() {
         partId: i.partId,
         partsCompleted: String(i.partsCompleted),
         partsRejected: i.partsRejected ? String(i.partsRejected) : "",
+        rejectedWeight:
+          i.rejectedWeight === null ? "" : weightToInput(i.rejectedWeight),
       }))
     );
   };
@@ -219,7 +233,7 @@ export default function FettlingPage() {
     if (!partId) return;
     setLines((current) => [
       ...current,
-      { partId, partsCompleted: "", partsRejected: "" },
+      { partId, partsCompleted: "", partsRejected: "", rejectedWeight: "" },
     ]);
     setPartToAdd("");
   };
@@ -269,6 +283,12 @@ export default function FettlingPage() {
         partId: l.partId,
         partsCompleted: parseInt(l.partsCompleted) || 0,
         partsRejected: parseInt(l.partsRejected) || 0,
+        // Blank is sent as null, which tells the API to keep using the count
+        // times the part weight rather than booking nothing
+        rejectedWeight:
+          l.rejectedWeight.trim() === ""
+            ? null
+            : parseWeightInput(l.rejectedWeight),
       })),
     };
 
@@ -658,6 +678,9 @@ export default function FettlingPage() {
                   const done = parseInt(line.partsCompleted) || 0;
                   const rej = parseInt(line.partsRejected) || 0;
                   const over = rej > done;
+                  // What whole castings would weigh. Offered as the placeholder
+                  // so the operator sees the figure their entry replaces.
+                  const calculated = rej * (part?.weightPerPiece ?? 0);
 
                   return (
                     <div
@@ -683,7 +706,7 @@ export default function FettlingPage() {
                         </Button>
                       </div>
 
-                      <div className="grid grid-cols-3 gap-3">
+                      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
                         <Input
                           label="Done"
                           type="number"
@@ -709,6 +732,27 @@ export default function FettlingPage() {
                             })
                           }
                         />
+                        {/* The bench scale beats the arithmetic when there is
+                            a reading: a reject can be a part-filled pour, so
+                            the count does not always give its weight. Left
+                            blank, the calculated figure below is what gets
+                            booked. */}
+                        <Input
+                          label={`Rejected Scrap (${WEIGHT_UNIT})`}
+                          type="number"
+                          min="0"
+                          step="any"
+                          disabled={rej === 0}
+                          placeholder={
+                            rej === 0 ? "-" : weightToInput(calculated)
+                          }
+                          value={line.rejectedWeight}
+                          onChange={(e) =>
+                            updateLine(line.partId, {
+                              rejectedWeight: e.target.value,
+                            })
+                          }
+                        />
                         {/* Accepted is shown, never typed - it is the
                             difference, so it cannot be entered wrong */}
                         <div>
@@ -720,6 +764,33 @@ export default function FettlingPage() {
                           </div>
                         </div>
                       </div>
+
+                      {rej > 0 && (
+                        <p className="mt-2 text-xs text-[var(--muted-foreground)]">
+                          {line.rejectedWeight.trim() === "" ? (
+                            <>
+                              Booking{" "}
+                              <span className="font-medium text-[var(--foreground)]">
+                                {formatWeight(calculated)}
+                              </span>{" "}
+                              to rejected scrap &mdash; {rej} x{" "}
+                              {formatWeight(part?.weightPerPiece ?? 0)}. Enter a
+                              weight to use the real one instead.
+                            </>
+                          ) : (
+                            <>
+                              Booking{" "}
+                              <span className="font-medium text-amber-600">
+                                {formatWeight(
+                                  parseWeightInput(line.rejectedWeight)
+                                )}
+                              </span>{" "}
+                              to rejected scrap, as weighed &mdash; the count
+                              works out to {formatWeight(calculated)}.
+                            </>
+                          )}
+                        </p>
+                      )}
                     </div>
                   );
                 })}

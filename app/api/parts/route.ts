@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
+import { GRADE_NAMES } from "@/lib/ingot";
 import { getSession } from "@/lib/auth";
 import { canRead, canWrite } from "@/lib/permissions";
 import { parsePagination, buildPaginationMeta } from "@/lib/pagination";
@@ -72,6 +73,49 @@ const { searchParams } = new URL(request.url);
   }
 }
 
+/**
+ * Validates the two weights a part is described by.
+ *
+ * Expected scrap is not among them: it is the gating poured with the casting
+ * and cut off again, so it is exactly the difference between these two, and
+ * lib/parts.ts works it out wherever it is shown. Nothing writes it, so nothing
+ * can write a value that contradicts the weights.
+ *
+ * Both inputs arrive in grams; callers convert from the kg the operator types.
+ */
+function castingWeights(
+  weightPerPieceInput: unknown,
+  pouringWeightInput: unknown
+): { ok: true; value: { weightPerPiece: number; pouringWeight: number | null } } | { ok: false; error: string } {
+  const weightPerPiece = parseFloat(String(weightPerPieceInput));
+  if (!Number.isFinite(weightPerPiece) || weightPerPiece <= 0) {
+    return { ok: false, error: "Part weight must be a number greater than zero" };
+  }
+
+  // Left blank stays blank. A part whose gating nobody has measured is a real
+  // state, and null records it honestly - substituting the finished weight
+  // would assert the mould takes no extra metal, which is never true.
+  if (pouringWeightInput === undefined || pouringWeightInput === null || pouringWeightInput === "") {
+    return { ok: true, value: { weightPerPiece, pouringWeight: null } };
+  }
+
+  const pouringWeight = parseFloat(String(pouringWeightInput));
+  if (!Number.isFinite(pouringWeight) || pouringWeight <= 0) {
+    return { ok: false, error: "Pouring weight must be a number greater than zero" };
+  }
+
+  // Less metal poured than the casting weighs is not a tolerance question -
+  // it is a typo, and it would otherwise produce negative expected scrap.
+  if (pouringWeight < weightPerPiece) {
+    return {
+      ok: false,
+      error: "Pouring weight cannot be less than the finished part weight - the gating is poured on top of the casting",
+    };
+  }
+
+  return { ok: true, value: { weightPerPiece, pouringWeight } };
+}
+
 // POST - Create new part
 export async function POST(request: NextRequest) {
   try {
@@ -89,7 +133,16 @@ export async function POST(request: NextRequest) {
     }
 
     const body = await request.json();
-    const { partCode, name, description, weightPerPiece, expectedScrap } = body;
+    const { partCode, name, description, weightPerPiece, pouringWeight, alloyGrade } = body;
+
+    // The alloy decides which scrap line a rejected casting is booked to, so
+    // an unknown one would quietly send metal to the wrong place
+    if (alloyGrade !== undefined && !GRADE_NAMES.includes(String(alloyGrade))) {
+      return NextResponse.json(
+        { error: `Alloy must be one of ${GRADE_NAMES.join(", ")}` },
+        { status: 400 }
+      );
+    }
 
     if (!partCode || !name || !weightPerPiece) {
       return NextResponse.json(
@@ -109,13 +162,18 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    const weights = castingWeights(weightPerPiece, pouringWeight);
+    if (!weights.ok) {
+      return NextResponse.json({ error: weights.error }, { status: 400 });
+    }
+
     const part = await prisma.part.create({
       data: {
         partCode,
         name,
         description: description || null,
-        weightPerPiece: parseFloat(weightPerPiece),
-        expectedScrap: parseFloat(expectedScrap) || 0,
+        ...weights.value,
+        ...(alloyGrade !== undefined ? { alloyGrade: String(alloyGrade) } : {}),
         isActive: true,
       },
     });
@@ -147,10 +205,24 @@ export async function PUT(request: NextRequest) {
     }
 
     const body = await request.json();
-    const { id, partCode, name, description, weightPerPiece, expectedScrap, isActive } = body;
+    const { id, partCode, name, description, weightPerPiece, pouringWeight, isActive, alloyGrade } = body;
 
     if (!id) {
       return NextResponse.json({ error: "Part ID is required" }, { status: 400 });
+    }
+
+    // Same check as on create - an unknown alloy would send a rejected
+    // casting's metal to a stock line that does not exist
+    if (alloyGrade !== undefined && !GRADE_NAMES.includes(String(alloyGrade))) {
+      return NextResponse.json(
+        { error: `Alloy must be one of ${GRADE_NAMES.join(", ")}` },
+        { status: 400 }
+      );
+    }
+
+    const weights = castingWeights(weightPerPiece, pouringWeight);
+    if (!weights.ok) {
+      return NextResponse.json({ error: weights.error }, { status: 400 });
     }
 
     const part = await prisma.part.update({
@@ -159,8 +231,8 @@ export async function PUT(request: NextRequest) {
         partCode,
         name,
         description,
-        weightPerPiece: parseFloat(weightPerPiece),
-        expectedScrap: parseFloat(expectedScrap) || 0,
+        ...weights.value,
+        ...(alloyGrade !== undefined ? { alloyGrade: String(alloyGrade) } : {}),
         isActive: isActive ?? true,
       },
     });

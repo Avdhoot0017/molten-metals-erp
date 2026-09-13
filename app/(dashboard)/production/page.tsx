@@ -108,12 +108,20 @@ import {
   weightToInput,
   WEIGHT_UNIT,
 } from "@/lib/units";
+import { expectedScrapOf } from "@/lib/parts";
 
 interface Part {
   id: string;
   partCode: string;
   name: string;
+  /** The finished casting, in grams. */
   weightPerPiece: number;
+  /**
+   * Metal poured for one casting, in grams - the part plus its gating. Null on
+   * parts recorded before it was tracked; those are left out of the expected
+   * figures rather than counted as nothing.
+   */
+  pouringWeight: number | null;
 }
 
 /** One part line inside the batch being entered. */
@@ -630,6 +638,39 @@ export default function ProductionPage() {
     },
     { quantityProduced: 0, goodParts: 0, rejectedParts: 0 }
   );
+
+  /**
+   * What the parts on this batch say the metal should look like.
+   *
+   * Each part carries its pouring weight and the gating that comes off it, so
+   * once the counts are entered both figures follow: how much runner scrap to
+   * expect back, and how much metal the moulds took in total. Shown next to the
+   * inputs so the operator can compare before saving - they are a reference,
+   * not a limit, and nothing is validated against them.
+   *
+   * Counted on castings poured, not good ones: a casting that was rejected
+   * still had its gating cut off.
+   */
+  const expectedFromParts = React.useMemo(() => {
+    let scrap = 0;
+    let poured = 0;
+    let counted = 0;
+    for (const line of partLines) {
+      const qty = parseInt(line.quantityProduced) || 0;
+      if (qty <= 0) continue;
+      const part = parts.find((p) => p.id === line.partId);
+      if (!part) continue;
+      // A part added before pouring weights were recorded has none; it would
+      // otherwise drag the total down and look like a shortfall.
+      const perCasting = expectedScrapOf(part);
+      if (perCasting === null || !part.pouringWeight) continue;
+      scrap += qty * perCasting;
+      poured += qty * part.pouringWeight;
+      counted += 1;
+    }
+    return { scrap, poured, known: counted > 0 };
+  }, [partLines, parts]);
+
 
   /**
    * Stage 1 - charge the furnace.
@@ -1866,19 +1907,27 @@ export default function ProductionPage() {
               <Recycle className="h-4 w-4 text-[var(--primary)]" />
               Scrap Generated ({WEIGHT_UNIT})
             </h4>
-            <div className="grid grid-cols-3 gap-4">
-              <Input
-                label="Runner & Raiser"
-                type="number"
-                min="0"
-                step="any"
-                placeholder="Weight in kg"
-                value={formData.runnerRaiserScrap}
-                onChange={(e) =>
-                  setFormData({ ...formData, runnerRaiserScrap: e.target.value })
-                }
-                className="h-12"
-              />
+            <div className="grid grid-cols-3 gap-4 items-start">
+              <div>
+                <Input
+                  label="Runner & Raiser"
+                  type="number"
+                  min="0"
+                  step="any"
+                  placeholder="Weight in kg"
+                  value={formData.runnerRaiserScrap}
+                  onChange={(e) =>
+                    setFormData({ ...formData, runnerRaiserScrap: e.target.value })
+                  }
+                  className="h-12"
+                />
+                {expectedFromParts.known && (
+                  <p className="mt-1.5 text-xs font-medium text-amber-600">
+                    Expected for these castings:{" "}
+                    {formatWeight(expectedFromParts.scrap)}
+                  </p>
+                )}
+              </div>
               <Input
                 label="Spillage"
                 type="number"
@@ -1891,21 +1940,29 @@ export default function ProductionPage() {
                 }
                 className="h-12"
               />
-              <Input
-                label="Rejected Part Scrap"
-                type="number"
-                min="0"
-                step="any"
-                placeholder="Weight in kg"
-                value={formData.rejectedPartScrap}
-                onChange={(e) =>
-                  setFormData({
-                    ...formData,
-                    rejectedPartScrap: e.target.value,
-                  })
-                }
-                className="h-12"
-              />
+              <div>
+                <Input
+                  label="Rejected Part Scrap"
+                  type="number"
+                  min="0"
+                  step="any"
+                  placeholder="Weight in kg"
+                  value={formData.rejectedPartScrap}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      rejectedPartScrap: e.target.value,
+                    })
+                  }
+                  className="h-12"
+                />
+                {expectedFromParts.known && (
+                  <p className="mt-1.5 text-xs font-medium text-amber-600">
+                    Pouring weight for these castings:{" "}
+                    {formatWeight(expectedFromParts.poured)}
+                  </p>
+                )}
+              </div>
             </div>
           </div>
 

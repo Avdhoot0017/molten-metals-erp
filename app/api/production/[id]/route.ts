@@ -495,6 +495,7 @@ async function amendBatch(
   const meltInput = charge.aluminumUsedNum + charge.totalScrapUsedNum;
   const efficiency = meltInput > 0 ? (output.expectedOutput / meltInput) * 100 : 0;
 
+
   const result = await prisma.$transaction(async (tx) => {
     await tx.productionItem.deleteMany({ where: { productionRecordId: id } });
 
@@ -641,6 +642,7 @@ async function completeBatch(
     runnerRaiserScrap: number;
     spillageScrap: number;
     rejectedPartScrap: number;
+    notes: string | null;
   },
   body: Record<string, unknown>,
   userId: string
@@ -749,6 +751,7 @@ async function completeBatch(
   // re-melted at stage 1 is included alongside the fresh ingot.
   const meltInput = record.aluminumUsed + record.totalScrapUsed;
   const efficiency = meltInput > 0 ? (expectedOutput / meltInput) * 100 : 0;
+
 
   // Scrap takes the grade of the heat it came off
   const batchGrade = gradeName(record.ingotGrade as never);

@@ -20,7 +20,9 @@ import { LoadingSpinner } from "@/components/ui/loading";
 import { formatWeight, formatDate } from "@/lib/utils";
 import { Pagination, type PaginationMeta } from "@/components/ui/pagination";
 import { parseWeightInput, weightToInput, WEIGHT_UNIT } from "@/lib/units";
+import { expectedScrapOf } from "@/lib/parts";
 import { canWrite } from "@/lib/permissions";
+import { ALLOY_GRADES, gradeSpec } from "@/lib/ingot";
 import type { UserRole } from "@/types";
 
 interface Part {
@@ -28,10 +30,72 @@ interface Part {
   partCode: string;
   name: string;
   description?: string;
+  /** The finished casting, in grams. */
   weightPerPiece: number;
-  expectedScrap: number;
+  /**
+   * Metal poured for one casting, in grams - the part plus its gating. Null on
+   * parts recorded before it was tracked.
+   */
+  pouringWeight: number | null;
+  /** The alloy it is cast in - decides which scrap line a reject is booked to. */
+  alloyGrade: string;
   isActive: boolean;
   createdAt: string;
+}
+
+/**
+ * Expected scrap per casting, shown rather than asked for.
+ *
+ * It is the gating - runners, risers, feeders - poured with the part and cut
+ * off again, so it is fully determined by the two weights above it. It used to
+ * be typed in as a percentage, which meant it could contradict them; deriving
+ * it here, and again on the server before saving, means it cannot.
+ */
+function ExpectedScrapReadout({
+  weightPerPiece,
+  pouringWeight,
+}: {
+  weightPerPiece: string;
+  pouringWeight: string;
+}) {
+  const finished = parseWeightInput(weightPerPiece);
+  const poured = parseWeightInput(pouringWeight);
+  const ready = finished > 0 && poured > 0;
+  // Pouring less than the casting weighs is a typo, not a thin gating system.
+  const impossible = ready && poured < finished;
+  const scrap = ready && !impossible ? poured - finished : 0;
+
+  return (
+    <div>
+      <span className="mb-1.5 block text-sm font-medium text-[var(--foreground)]">
+        Expected Scrap ({WEIGHT_UNIT})
+      </span>
+      <div
+        className={`flex h-12 items-center rounded-lg border px-3 ${
+          impossible
+            ? "border-[var(--destructive)] bg-[var(--destructive)]/5"
+            : "border-[var(--border)] bg-[var(--muted)]"
+        }`}
+      >
+        {impossible ? (
+          <span className="text-sm text-[var(--destructive)]">
+            Pouring weight is below the part weight
+          </span>
+        ) : ready ? (
+          <span className="font-medium">{formatWeight(scrap)}</span>
+        ) : (
+          <span className="text-sm text-[var(--muted-foreground)]">
+            Enter both weights
+          </span>
+        )}
+      </div>
+      <p className="mt-1.5 text-xs text-[var(--muted-foreground)]">
+        {ready && !impossible
+          ? `Gating cut off each casting - ${((scrap / poured) * 100).toFixed(1)}% of the metal poured.`
+          : "Worked out from the pouring weight minus the part weight."}
+      </p>
+    </div>
+  );
 }
 
 export default function PartsPage() {
@@ -61,7 +125,8 @@ export default function PartsPage() {
     name: "",
     description: "",
     weightPerPiece: "",
-    expectedScrap: "",
+    pouringWeight: "",
+    alloyGrade: "LM6",
   });
 
   // Debounce typing so we do not hit the API on every keystroke
@@ -112,7 +177,8 @@ export default function PartsPage() {
       name: "",
       description: "",
       weightPerPiece: "",
-      expectedScrap: "",
+      pouringWeight: "",
+      alloyGrade: "LM6",
     });
     setError("");
   };
@@ -127,6 +193,8 @@ export default function PartsPage() {
         body: JSON.stringify({
           ...formData,
           weightPerPiece: parseWeightInput(formData.weightPerPiece),
+          pouringWeight: parseWeightInput(formData.pouringWeight),
+          alloyGrade: formData.alloyGrade,
         }),
       });
       const data = await response.json();
@@ -169,6 +237,8 @@ export default function PartsPage() {
           id: selectedPart.id,
           ...formData,
           weightPerPiece: parseWeightInput(formData.weightPerPiece),
+          pouringWeight: parseWeightInput(formData.pouringWeight),
+          alloyGrade: formData.alloyGrade,
         }),
       });
       const data = await response.json();
@@ -213,7 +283,9 @@ export default function PartsPage() {
       name: part.name,
       description: part.description || "",
       weightPerPiece: weightToInput(part.weightPerPiece),
-      expectedScrap: part.expectedScrap.toString(),
+      // Blank stays blank - this part's gating has never been measured
+      pouringWeight: part.pouringWeight ? weightToInput(part.pouringWeight) : "",
+      alloyGrade: part.alloyGrade ?? "LM6",
     });
     setIsEditModalOpen(true);
   };
@@ -359,6 +431,12 @@ export default function PartsPage() {
                       Weight/Piece
                     </th>
                     <th className="text-left py-3 px-4 font-semibold text-sm">
+                      Pouring Weight
+                    </th>
+                    <th className="text-left py-3 px-4 font-semibold text-sm">
+                      Alloy
+                    </th>
+                    <th className="text-left py-3 px-4 font-semibold text-sm">
                       Expected Scrap
                     </th>
                     <th className="text-left py-3 px-4 font-semibold text-sm">
@@ -396,7 +474,35 @@ export default function PartsPage() {
                       <td className="py-3 px-4">
                         {formatWeight(part.weightPerPiece)}
                       </td>
-                      <td className="py-3 px-4">{part.expectedScrap}%</td>
+                      <td className="py-3 px-4">
+                        {part.pouringWeight ? (
+                          formatWeight(part.pouringWeight)
+                        ) : (
+                          <span className="text-sm text-[var(--muted-foreground)]">
+                            Not recorded
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-3 px-4">
+                        <span className="inline-flex items-center gap-2 text-sm">
+                          <span
+                            className={`h-2 w-2 rounded-full ${gradeSpec(part.alloyGrade).dotClass}`}
+                          />
+                          {part.alloyGrade}
+                        </span>
+                      </td>
+                      <td className="py-3 px-4">
+                        {(() => {
+                          const scrap = expectedScrapOf(part);
+                          return scrap === null ? (
+                            <span className="text-sm text-[var(--muted-foreground)]">
+                              &mdash;
+                            </span>
+                          ) : (
+                            formatWeight(scrap)
+                          );
+                        })()}
+                      </td>
                       <td className="py-3 px-4">
                         <Badge variant={part.isActive ? "success" : "secondary"}>
                           {part.isActive ? "Active" : "Inactive"}
@@ -494,22 +600,67 @@ export default function PartsPage() {
             <Input
               label={`Weight per Piece (${WEIGHT_UNIT})`}
               type="number"
-              placeholder="Enter weight in kg"
+              placeholder="Finished casting weight"
               value={formData.weightPerPiece}
               onChange={(e) =>
                 setFormData({ ...formData, weightPerPiece: e.target.value })
               }
               className="h-12"
             />
+            {/* The mould takes more metal than the casting keeps - runners,
+                risers and feeders are poured with it and cut off afterwards.
+                Recording both figures is what lets the expected scrap below be
+                worked out instead of guessed at. */}
             <Input
-              label="Expected Scrap (%)"
+              label={`Pouring Weight (${WEIGHT_UNIT})`}
               type="number"
-              placeholder="Enter expected scrap percentage"
-              value={formData.expectedScrap}
+              placeholder="Metal poured, including gating"
+              value={formData.pouringWeight}
               onChange={(e) =>
-                setFormData({ ...formData, expectedScrap: e.target.value })
+                setFormData({ ...formData, pouringWeight: e.target.value })
               }
               className="h-12"
+            />
+
+            {/* The alloy is asked for here, once, rather than on every fettling
+                entry - a casting drawing specifies one. It decides which scrap
+                line a rejected casting's metal is booked to. */}
+            <div>
+              <span className="mb-1.5 block text-sm font-medium text-[var(--foreground)]">
+                Alloy
+              </span>
+              <div className="inline-flex gap-1 rounded-lg bg-[var(--muted)] p-1">
+                {ALLOY_GRADES.map((g) => {
+                  const active = formData.alloyGrade === g.grade;
+                  return (
+                    <button
+                      key={g.grade}
+                      type="button"
+                      onClick={() =>
+                        setFormData({ ...formData, alloyGrade: g.grade })
+                      }
+                      className={`cursor-pointer rounded-md px-4 py-2 text-sm font-medium transition-colors ${
+                        active
+                          ? "bg-[var(--card)] text-[var(--foreground)] shadow-sm"
+                          : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+                      }`}
+                    >
+                      <span className="flex items-center gap-2">
+                        <span className={`h-2 w-2 rounded-full ${g.dotClass}`} />
+                        {g.grade}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="mt-1.5 text-xs text-[var(--muted-foreground)]">
+                {gradeSpec(formData.alloyGrade).description}. Rejected castings
+                are booked to this grade&apos;s scrap.
+              </p>
+            </div>
+            <ExpectedScrapReadout
+              weightPerPiece={formData.weightPerPiece}
+              pouringWeight={formData.pouringWeight}
             />
             <div className="col-span-2">
               <Textarea
@@ -580,22 +731,67 @@ export default function PartsPage() {
             <Input
               label={`Weight per Piece (${WEIGHT_UNIT})`}
               type="number"
-              placeholder="Enter weight in kg"
+              placeholder="Finished casting weight"
               value={formData.weightPerPiece}
               onChange={(e) =>
                 setFormData({ ...formData, weightPerPiece: e.target.value })
               }
               className="h-12"
             />
+            {/* The mould takes more metal than the casting keeps - runners,
+                risers and feeders are poured with it and cut off afterwards.
+                Recording both figures is what lets the expected scrap below be
+                worked out instead of guessed at. */}
             <Input
-              label="Expected Scrap (%)"
+              label={`Pouring Weight (${WEIGHT_UNIT})`}
               type="number"
-              placeholder="Enter expected scrap percentage"
-              value={formData.expectedScrap}
+              placeholder="Metal poured, including gating"
+              value={formData.pouringWeight}
               onChange={(e) =>
-                setFormData({ ...formData, expectedScrap: e.target.value })
+                setFormData({ ...formData, pouringWeight: e.target.value })
               }
               className="h-12"
+            />
+
+            {/* The alloy is asked for here, once, rather than on every fettling
+                entry - a casting drawing specifies one. It decides which scrap
+                line a rejected casting's metal is booked to. */}
+            <div>
+              <span className="mb-1.5 block text-sm font-medium text-[var(--foreground)]">
+                Alloy
+              </span>
+              <div className="inline-flex gap-1 rounded-lg bg-[var(--muted)] p-1">
+                {ALLOY_GRADES.map((g) => {
+                  const active = formData.alloyGrade === g.grade;
+                  return (
+                    <button
+                      key={g.grade}
+                      type="button"
+                      onClick={() =>
+                        setFormData({ ...formData, alloyGrade: g.grade })
+                      }
+                      className={`cursor-pointer rounded-md px-4 py-2 text-sm font-medium transition-colors ${
+                        active
+                          ? "bg-[var(--card)] text-[var(--foreground)] shadow-sm"
+                          : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+                      }`}
+                    >
+                      <span className="flex items-center gap-2">
+                        <span className={`h-2 w-2 rounded-full ${g.dotClass}`} />
+                        {g.grade}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="mt-1.5 text-xs text-[var(--muted-foreground)]">
+                {gradeSpec(formData.alloyGrade).description}. Rejected castings
+                are booked to this grade&apos;s scrap.
+              </p>
+            </div>
+            <ExpectedScrapReadout
+              weightPerPiece={formData.weightPerPiece}
+              pouringWeight={formData.pouringWeight}
             />
             <div className="col-span-2">
               <Textarea

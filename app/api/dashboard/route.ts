@@ -7,6 +7,7 @@ import {
   totalIngot,
   type MaterialForm,
 } from "@/lib/ingot";
+import { expectedScrapOf } from "@/lib/parts";
 import prisma from "@/lib/prisma";
 import { getSettings } from "@/lib/settings";
 import { getSession } from "@/lib/auth";
@@ -162,7 +163,8 @@ export async function GET() {
         partCode: true,
         name: true,
         weightPerPiece: true,
-        expectedScrap: true,
+        pouringWeight: true,
+        alloyGrade: true,
       },
       orderBy: { partCode: "asc" },
     });
@@ -229,26 +231,61 @@ export async function GET() {
       rollupByPart.set(item.partId, current);
     }
 
+    // Fettling rejects belong in a part's figures too. A casting scrapped at
+    // the fettling bench is just as rejected as one scrapped at the furnace,
+    // and counting only the latter flattered every part's rejection rate.
+    const fettlingByPart = await prisma.fettlingActivityItem.groupBy({
+      by: ["partId"],
+      _sum: { partsCompleted: true, partsRejected: true },
+    });
+    const fettlingFor = new Map(
+      fettlingByPart.map((row) => [
+        row.partId,
+        {
+          handled: row._sum.partsCompleted ?? 0,
+          rejected: row._sum.partsRejected ?? 0,
+        },
+      ])
+    );
+
     const partAnalytics = activeParts.map((part) => {
       const agg = rollupByPart.get(part.id);
       const produced = agg?.quantityProduced ?? 0;
-      const rejected = agg?.rejectedParts ?? 0;
+      const castingRejects = agg?.rejectedParts ?? 0;
+      const fettling = fettlingFor.get(part.id) ?? { handled: 0, rejected: 0 };
+
+      // Every piece that failed, wherever it failed
+      const rejected = castingRejects + fettling.rejected;
+      // The rate is against what was actually inspected - castings produced,
+      // plus anything the fettling bench handled that the casting count does
+      // not already cover
+      const inspected = Math.max(produced, fettling.handled);
 
       return {
         id: part.id,
         partCode: part.partCode,
         name: part.name,
         weightPerPiece: part.weightPerPiece,
-        expectedScrap: part.expectedScrap,
+        alloyGrade: part.alloyGrade,
+        pouringWeight: part.pouringWeight,
+        // Gating per casting, worked out from the two weights rather than
+        // stored - null where the pouring weight was never recorded
+        expectedScrap: expectedScrapOf(part),
         batches: agg?.batches.size ?? 0,
         quantityProduced: produced,
         goodParts: agg?.goodParts ?? 0,
         rejectedParts: rejected,
+        // Split out, because "where is it failing" is the useful question
+        castingRejects,
+        fettlingRejects: fettling.rejected,
+        fettlingHandled: fettling.handled,
+        /** What the rejected castings weigh, at this part's own weight. */
+        rejectedWeight: rejected * part.weightPerPiece,
         aluminumUsed: agg?.aluminumUsed ?? 0,
         totalScrap: agg?.totalScrap ?? 0,
         avgEfficiency:
           agg && agg.efficiencyCount > 0 ? agg.efficiencySum / agg.efficiencyCount : 0,
-        rejectionRate: produced > 0 ? (rejected / produced) * 100 : 0,
+        rejectionRate: inspected > 0 ? (rejected / inspected) * 100 : 0,
       };
     });
 
