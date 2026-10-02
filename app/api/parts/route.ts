@@ -24,11 +24,22 @@ export async function GET(request: NextRequest) {
 const { searchParams } = new URL(request.url);
     const { paginated, page, pageSize, skip, take } = parsePagination(searchParams);
     const search = searchParams.get("search")?.trim();
+    const status = searchParams.get("status")?.trim();
+    const alloy = searchParams.get("alloy")?.trim();
 
-    // Search is applied in the database so it spans every page, not just the
-    // rows already loaded in the browser.
+    /*
+     * Filters are applied in the database so they span every page, not just
+     * the rows already loaded in the browser.
+     *
+     * Active-only stays the DEFAULT rather than the rule: the production form
+     * reads this list to fill its part dropdown and must never offer a retired
+     * part. But the catalogue has a Status column, and with the rule hard-coded
+     * that column could only ever say "Active" - a retired part simply vanished
+     * with nothing to say where it went.
+     */
     const where: Prisma.PartWhereInput = {
-      isActive: true,
+      ...(status === "all" ? {} : { isActive: status !== "inactive" }),
+      ...(alloy ? { alloyGrade: alloy } : {}),
       ...(search
         ? {
             OR: [
@@ -45,9 +56,65 @@ const { searchParams } = new URL(request.url);
       const parts = await prisma.part.findMany({
         where,
         orderBy: { createdAt: "desc" },
+        include: routeInclude,
       });
       return NextResponse.json({ success: true, data: parts });
     }
+
+    /*
+     * Headline figures for the catalogue page.
+     *
+     * Counted in the database over every part, not over the ten rows on
+     * screen - the cards used to read "Total Parts 10, Active Parts 17",
+     * because one was the page and the other the catalogue.
+     */
+    const summary = searchParams.get("summary") === "1"
+      ? await (async () => {
+          const [partCount, unmapped, madeByPart, readyStock] = await Promise.all([
+            prisma.part.count({ where: { isActive: true } }),
+            prisma.part.count({
+              where: { isActive: true, routeSteps: { none: {} } },
+            }),
+            prisma.productionItem.groupBy({
+              by: ["partId"],
+              _sum: { quantityProduced: true },
+              orderBy: { _sum: { quantityProduced: "desc" } },
+              take: 1,
+            }),
+            prisma.partStage.aggregate({
+              where: { stageKey: "READY" },
+              _sum: { quantity: true },
+            }),
+          ]);
+
+          const top = madeByPart[0];
+          const topPart = top
+            ? await prisma.part.findUnique({
+                where: { id: top.partId },
+                select: { partCode: true, name: true },
+              })
+            : null;
+
+          const madeTotal = await prisma.productionItem.aggregate({
+            _sum: { quantityProduced: true },
+          });
+
+          return {
+            parts: partCount,
+            /** Active parts nobody has mapped out yet - they cannot be tracked. */
+            withoutSteps: unmapped,
+            totalMade: madeTotal._sum.quantityProduced ?? 0,
+            readyStock: readyStock._sum.quantity ?? 0,
+            mostMade: topPart
+              ? {
+                  partCode: topPart.partCode,
+                  name: topPart.name,
+                  quantity: top?._sum.quantityProduced ?? 0,
+                }
+              : null,
+          };
+        })()
+      : undefined;
 
     const [parts, total] = await Promise.all([
       prisma.part.findMany({
@@ -55,6 +122,7 @@ const { searchParams } = new URL(request.url);
         orderBy: { createdAt: "desc" },
         skip,
         take,
+        include: routeInclude,
       }),
       prisma.part.count({ where }),
     ]);
@@ -62,6 +130,7 @@ const { searchParams } = new URL(request.url);
     return NextResponse.json({
       success: true,
       data: parts,
+      ...(summary ? { summary } : {}),
       pagination: buildPaginationMeta(total, { page, pageSize }),
     });
   } catch (error) {
@@ -72,6 +141,81 @@ const { searchParams } = new URL(request.url);
     );
   }
 }
+
+/**
+ * Validates a part's route - the ordered processes its castings pass through.
+ *
+ * The route is what makes piece tracking possible: ten castings moving through
+ * three stations are ten pieces, not thirty, and knowing the order is the only
+ * way to tell those apart. It is replaced wholesale on save rather than
+ * patched step by step, so the stored sequence is always contiguous and in
+ * order - there is no way to leave a gap behind.
+ *
+ * An empty route is allowed. A part that has not been mapped out yet is an
+ * ordinary state, especially before the shop has worked through its catalogue.
+ */
+async function validateRoute(
+  raw: unknown
+): Promise<
+  | { ok: true; steps: Array<{ activityTypeId: string; sequence: number }> }
+  | { ok: false; error: string }
+> {
+  if (raw === undefined || raw === null) return { ok: true, steps: [] };
+  if (!Array.isArray(raw)) {
+    return { ok: false, error: "The route must be a list of processes" };
+  }
+  if (raw.length === 0) return { ok: true, steps: [] };
+
+  const ids: string[] = [];
+  for (const step of raw) {
+    const id = typeof step === "string" ? step : step?.activityTypeId;
+    if (!id || typeof id !== "string") {
+      return { ok: false, error: "Every step in the route needs a process" };
+    }
+    // The same station twice would make an entry for it ambiguous - which of
+    // the two is this? The database refuses it as well.
+    if (ids.includes(id)) {
+      return {
+        ok: false,
+        error: "A process can only appear once in a route",
+      };
+    }
+    ids.push(id);
+  }
+
+  const known = await prisma.activityType.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, isActive: true, name: true },
+  });
+  if (known.length !== ids.length) {
+    return { ok: false, error: "That process no longer exists" };
+  }
+  const inactive = known.find((a) => !a.isActive);
+  if (inactive) {
+    return {
+      ok: false,
+      error: `${inactive.name} is switched off - turn it back on in Settings before routing parts through it`,
+    };
+  }
+
+  // Position comes from the order they were sent in, so the caller never has
+  // to keep sequence numbers straight
+  return {
+    ok: true,
+    steps: ids.map((activityTypeId, index) => ({
+      activityTypeId,
+      sequence: index + 1,
+    })),
+  };
+}
+
+/** Route steps, in order, with the process named. */
+const routeInclude = {
+  routeSteps: {
+    orderBy: { sequence: "asc" },
+    include: { activityType: { select: { id: true, name: true } } },
+  },
+} satisfies Prisma.PartInclude;
 
 /**
  * Validates the two weights a part is described by.
@@ -133,7 +277,16 @@ export async function POST(request: NextRequest) {
     }
 
     const body = await request.json();
-    const { partCode, name, description, weightPerPiece, pouringWeight, alloyGrade } = body;
+    const {
+      partCode,
+      name,
+      description,
+      weightPerPiece,
+      pouringWeight,
+      alloyGrade,
+      // The ordered processes this part's castings pass through
+      route,
+    } = body;
 
     // The alloy decides which scrap line a rejected casting is booked to, so
     // an unknown one would quietly send metal to the wrong place
@@ -167,6 +320,11 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: weights.error }, { status: 400 });
     }
 
+    const routeCheck = await validateRoute(route);
+    if (!routeCheck.ok) {
+      return NextResponse.json({ error: routeCheck.error }, { status: 400 });
+    }
+
     const part = await prisma.part.create({
       data: {
         partCode,
@@ -175,7 +333,9 @@ export async function POST(request: NextRequest) {
         ...weights.value,
         ...(alloyGrade !== undefined ? { alloyGrade: String(alloyGrade) } : {}),
         isActive: true,
+        routeSteps: { create: routeCheck.steps },
       },
+      include: routeInclude,
     });
 
     return NextResponse.json({ success: true, data: part }, { status: 201 });
@@ -205,7 +365,17 @@ export async function PUT(request: NextRequest) {
     }
 
     const body = await request.json();
-    const { id, partCode, name, description, weightPerPiece, pouringWeight, isActive, alloyGrade } = body;
+    const {
+      id,
+      partCode,
+      name,
+      description,
+      weightPerPiece,
+      pouringWeight,
+      isActive,
+      alloyGrade,
+      route,
+    } = body;
 
     if (!id) {
       return NextResponse.json({ error: "Part ID is required" }, { status: 400 });
@@ -225,16 +395,41 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json({ error: weights.error }, { status: 400 });
     }
 
-    const part = await prisma.part.update({
-      where: { id },
-      data: {
-        partCode,
-        name,
-        description,
-        ...weights.value,
-        ...(alloyGrade !== undefined ? { alloyGrade: String(alloyGrade) } : {}),
-        isActive: isActive ?? true,
-      },
+    const routeCheck = await validateRoute(route);
+    if (!routeCheck.ok) {
+      return NextResponse.json({ error: routeCheck.error }, { status: 400 });
+    }
+
+    /*
+     * The route is replaced, not patched.
+     *
+     * Deleting and recreating inside one transaction sidesteps the reordering
+     * problem entirely: moving a step from position 3 to 1 by updating rows
+     * would collide with the unique constraint halfway through, and every
+     * order of updates has some case where it does. Wiping first cannot.
+     *
+     * Route steps carry no history of their own - the piece movements do -
+     * so nothing is lost by recreating them.
+     */
+    const part = await prisma.$transaction(async (tx) => {
+      if (route !== undefined) {
+        await tx.partRouteStep.deleteMany({ where: { partId: id } });
+      }
+      return tx.part.update({
+        where: { id },
+        data: {
+          partCode,
+          name,
+          description,
+          ...weights.value,
+          ...(alloyGrade !== undefined ? { alloyGrade: String(alloyGrade) } : {}),
+          isActive: isActive ?? true,
+          ...(route !== undefined
+            ? { routeSteps: { create: routeCheck.steps } }
+            : {}),
+        },
+        include: routeInclude,
+      });
     });
 
     return NextResponse.json({ success: true, data: part });

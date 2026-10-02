@@ -153,6 +153,7 @@ const { searchParams } = new URL(request.url);
           },
         },
         furnace: { select: { id: true, name: true } },
+        operator: { select: { id: true, name: true, employeeCode: true } },
         user: {
           select: { name: true },
         },
@@ -210,6 +211,10 @@ const body = await request.json();
       runnerRaiserScrapUsed,
       spillageScrapUsed,
       rejectedPartScrapUsed,
+      // The batch whose leftover metal is being melted into this one, if any
+      carriedFromId,
+      // The shop-floor employee who ran this heat
+      operatorId,
       notes,
     } = body;
 
@@ -311,12 +316,118 @@ const body = await request.json();
 
     const totalScrapUsedNum = scrapUsed.reduce((sum, s) => sum + s.amount, 0);
 
+    /*
+     * Metal carried over from the previous heat on this furnace.
+     *
+     * This is the one part of the charge that moves no stock. It was deducted
+     * from inventory when that earlier batch was charged and has been sitting
+     * in the furnace ever since; taking it out again would remove the same
+     * kilos from stock twice.
+     */
+    let carriedIn = 0;
+    let heelSource: { id: string; batchNumber: string } | null = null;
+
+    if (carriedFromId) {
+      const source = await prisma.productionRecord.findUnique({
+        where: { id: String(carriedFromId) },
+        include: { carriedTo: { select: { batchNumber: true } } },
+      });
+
+      if (!source) {
+        return NextResponse.json(
+          { error: "That batch does not exist" },
+          { status: 404 }
+        );
+      }
+      /*
+       * The batch need not be closed, only counted.
+       *
+       * What it leaves behind is known the moment its castings are counted -
+       * charge less what was poured - and the metal is in the furnace from
+       * then on. Waiting for the scrap to be weighed would mean the next heat
+       * could not be charged with metal that is physically sitting in front of
+       * the operator.
+       */
+      if (!source.metalRemaining || source.metalRemaining <= 0) {
+        return NextResponse.json(
+          { error: `Batch ${source.batchNumber} has no metal left to carry over` },
+          { status: 400 }
+        );
+      }
+      // The database enforces this too; catching it here gives a usable message
+      if (source.carriedTo) {
+        return NextResponse.json(
+          {
+            error: `That metal has already been melted into batch ${source.carriedTo.batchNumber}`,
+          },
+          { status: 400 }
+        );
+      }
+      // Molten metal does not move between furnaces on its own
+      if (source.furnaceId !== (furnaceId || null)) {
+        return NextResponse.json(
+          {
+            error: `Batch ${source.batchNumber} ran on a different furnace - its metal is still in that one`,
+          },
+          { status: 400 }
+        );
+      }
+      // Pouring an LM6 heel into an LM9 heat contaminates the alloy, the same
+      // reason scrap is kept per grade
+      if (source.ingotGrade !== batchIngotType) {
+        return NextResponse.json(
+          {
+            error: `Batch ${source.batchNumber} left ${gradeName(source.ingotGrade)} metal, which cannot be melted into a ${gradeName(batchIngotType)} heat`,
+          },
+          { status: 400 }
+        );
+      }
+
+      carriedIn = source.metalRemaining;
+      heelSource = { id: source.id, batchNumber: source.batchNumber };
+    }
+
+    /*
+     * Who ran the heat - optional.
+     *
+     * Worth recording, because "who was on the furnace" is the question asked
+     * when a batch looks wrong and the login name does not answer it. But not
+     * required: a heat still has to be recordable at a terminal where nobody
+     * knows the operator's code, and refusing the batch would lose the whole
+     * entry over a field that is only a label.
+     *
+     * Never defaulted to the logged-in user either - the person typing is
+     * usually a manager writing up somebody else's shift, and a batch quietly
+     * stamped with the wrong name is worse than one with none.
+     */
+    let operator: { id: string; name: string } | null = null;
+    if (operatorId) {
+      const found = await prisma.employee.findUnique({
+        where: { id: String(operatorId) },
+        select: { id: true, isActive: true, name: true },
+      });
+      if (!found) {
+        return NextResponse.json({ error: "Employee not found" }, { status: 404 });
+      }
+      if (!found.isActive) {
+        return NextResponse.json(
+          { error: `${found.name} is no longer active` },
+          { status: 400 }
+        );
+      }
+      operator = { id: found.id, name: found.name };
+    }
+
     // Something has to go into the furnace, but it does not have to be fresh
-    // ingot - a heat run entirely on re-melted scrap is ordinary foundry work.
-    // So the requirement is on the CHARGE, not on the ingot alone.
-    if (aluminumUsedNum + totalScrapUsedNum <= 0) {
+    // ingot - a heat run entirely on re-melted scrap, or entirely on what the
+    // last heat left behind, is ordinary foundry work. So the requirement is on
+    // the CHARGE, not on the ingot alone.
+    if (aluminumUsedNum + totalScrapUsedNum + carriedIn <= 0) {
       return NextResponse.json(
-        { error: "Enter the ingot or the scrap charged into this heat" },
+        {
+          error:
+            "Enter the ingot or the scrap charged into this heat, or carry over the metal left in the furnace",
+        },
         { status: 400 }
       );
     }
@@ -378,6 +489,11 @@ const body = await request.json();
           spillageScrapUsed: scrapUsed[1].amount,
           rejectedPartScrapUsed: scrapUsed[2].amount,
           totalScrapUsed: totalScrapUsedNum,
+          // Part of the charge, deliberately absent from every stock movement
+          // below - this metal never went back into inventory to be taken out
+          carriedInWeight: carriedIn,
+          carriedFromId: heelSource?.id ?? null,
+          operatorId: operator?.id ?? null,
           notes: notes || null,
           createdBy: session.id,
         },
@@ -388,6 +504,7 @@ const body = await request.json();
             },
           },
           furnace: { select: { id: true, name: true } },
+          operator: { select: { id: true, name: true, employeeCode: true } },
           user: { select: { name: true } },
         },
       });

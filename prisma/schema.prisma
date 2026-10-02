@@ -125,6 +125,9 @@ model Part {
   productionItems    ProductionItem[]
   dispatches         DispatchItem[]
   fettlingActivities FettlingActivityItem[]
+  routeSteps         PartRouteStep[]
+  stages             PartStage[]
+  stageLogs          PartStageLog[]
 
   @@map("parts")
 }
@@ -142,8 +145,48 @@ model ActivityType {
 
   employees  Employee[]
   activities FettlingActivity[]
+  routeSteps PartRouteStep[]
 
   @@map("activity_types")
+}
+
+/**
+ * One stop on a part's journey through the shop, in order.
+ *
+ * A casting is not finished when it comes off the furnace: it is fettled, then
+ * decored, then cut, and so on, and the same ten pieces pass through every one
+ * of those stations. Recording the route is what lets the system tell "ten
+ * pieces moved one step" apart from "twenty pieces exist" - without it, each
+ * station's entry looked like new stock.
+ *
+ * The order matters beyond display: a piece may only be worked at the station
+ * holding it, and a piece sent back for rework may return to the step that
+ * rejected it or any step BEFORE it - never one after, which would skip the
+ * check that failed it.
+ */
+model PartRouteStep {
+  id             String @id @default(cuid())
+  partId         String
+  activityTypeId String
+  /** 1-based position in the route. Contiguous, ordered, no gaps. */
+  sequence       Int
+
+  createdAt DateTime @default(now())
+
+  part         Part         @relation(fields: [partId], references: [id], onDelete: Cascade)
+  activityType ActivityType @relation(fields: [activityTypeId], references: [id])
+  stages         PartStage[]
+  fettlingItems  FettlingActivityItem[] @relation("ItemRouteStep")
+  reworkItems    FettlingActivityItem[] @relation("ItemReworkFrom")
+  returnedItems  FettlingActivityItem[] @relation("ItemReturnTo")
+
+  // One part cannot have two steps in the same position...
+  @@unique([partId, sequence])
+  // ...nor the same process twice, which would make "which step is this entry
+  // for?" ambiguous at data-entry time
+  @@unique([partId, activityTypeId])
+  @@index([partId])
+  @@map("part_route_steps")
 }
 
 // Shop-floor employee. Tracked record only - employees do not log in.
@@ -162,8 +205,9 @@ model Employee {
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
-  activities   FettlingActivity[]
-  activityType ActivityType       @relation(fields: [activityTypeId], references: [id])
+  activities        FettlingActivity[]
+  productionBatches ProductionRecord[]
+  activityType      ActivityType       @relation(fields: [activityTypeId], references: [id])
 
   @@index([activityTypeId])
   @@map("employees")
@@ -220,8 +264,52 @@ model FettlingActivityItem {
    */
   rejectedWeight Float?
 
+  /**
+   * The station in the part's route this work belongs to.
+   *
+   * Null for two reasons, both meaning "not part of the piece flow": an entry
+   * recorded before routing existed, or a part with no route at all. Those
+   * entries still count as labour; they simply move no pieces, which is why
+   * their old figures cannot reintroduce the double count.
+   */
+  routeStepId String?
+
+  /**
+   * How many of the rejected pieces went for repair instead of the melt.
+   *
+   * A casting that fails a leak test is not always scrap - a weld can save it,
+   * and a foundry that melted every one of them would be pouring good metal
+   * back into the furnace for nothing. The rest (partsRejected - reworkQty) go
+   * to the melt and are booked as scrap metal, which is what every reject used
+   * to do.
+   */
+  reworkQty Int @default(0)
+
+  /**
+   * Set when this entry is repairing pieces rather than working the route.
+   *
+   * It names the station whose rework queue is being drained: a welder works
+   * on "the ones leak testing rejected", not on a step of the route. Route
+   * work has routeStepId set instead; exactly one of the two applies.
+   */
+  reworkFromStepId String?
+
+  /**
+   * Where repaired pieces rejoin the route.
+   *
+   * Defaults to the step that rejected them, and may be ANY step of the
+   * part's route. A weld can undo work that has to be redone, or leave a
+   * casting ready for a later stage - only the bench knows which, so the
+   * choice is theirs. Sending pieces past the step that rejected them does
+   * mean that check is not repeated.
+   */
+  returnStepId String?
+
   activity FettlingActivity @relation(fields: [activityId], references: [id], onDelete: Cascade)
   part     Part             @relation(fields: [partId], references: [id])
+  routeStep PartRouteStep?  @relation("ItemRouteStep", fields: [routeStepId], references: [id])
+  reworkFromStep PartRouteStep? @relation("ItemReworkFrom", fields: [reworkFromStepId], references: [id])
+  returnStep     PartRouteStep? @relation("ItemReturnTo", fields: [returnStepId], references: [id])
 
   // A part appears once per day's record; a second entry would be ambiguous
   @@unique([activityId, partId])
@@ -242,6 +330,92 @@ model AppSetting {
   updatedAt DateTime @updatedAt
 
   @@map("app_settings")
+}
+
+/**
+ * Where a piece is sitting.
+ *
+ * WAITING - queued at a station, not yet worked
+ * REWORK  - failed at a station and sent for repair rather than to the melt
+ * READY   - through the whole route, finished stock
+ */
+enum StageKind {
+  WAITING
+  REWORK
+  READY
+}
+
+/**
+ * How many pieces of one part are at one place in the shop.
+ *
+ * This is the table that fixes the counting. Before it, ten castings fettled
+ * and then decored read as twenty parts, because each station's entry was
+ * added up as fresh output. Here a station's entry MOVES pieces from one row
+ * to the next, so the same ten stay ten however many hands they pass through.
+ *
+ * Pieces are conserved: everything cast is waiting somewhere, in rework,
+ * finished, or scrapped. Nothing else can happen to it.
+ */
+model PartStage {
+  id     String @id @default(cuid())
+  partId String
+
+  /**
+   * Identifies the place, and is the unique key.
+   *
+   * A plain string ("STEP:<id>", "REWORK:<id>", "READY") rather than a pair of
+   * columns because READY has no step, and a NULL in a unique index counts as
+   * distinct in Postgres - two READY rows for the same part could be created,
+   * and the balance would silently split in half.
+   */
+  stageKey String
+
+  kind        StageKind
+  /** The station this row belongs to. Null only for READY. */
+  routeStepId String?
+  quantity    Int      @default(0)
+
+  lastUpdated DateTime @default(now())
+
+  part      Part           @relation(fields: [partId], references: [id], onDelete: Cascade)
+  routeStep PartRouteStep? @relation(fields: [routeStepId], references: [id], onDelete: Cascade)
+
+  @@unique([partId, stageKey])
+  @@index([partId])
+  @@index([routeStepId])
+  @@map("part_stages")
+}
+
+/**
+ * Every movement of pieces between stages, kept for the same reason
+ * inventory_logs is: a balance nobody can explain is a balance nobody trusts.
+ *
+ * Reconcilable the same way - the newest log row for a stage must agree with
+ * that stage's quantity.
+ */
+model PartStageLog {
+  id       String @id @default(cuid())
+  partId   String
+  stageKey String
+
+  /** Signed: pieces into this stage, or out of it. */
+  quantity    Int
+  previousQty Int
+  newQty      Int
+
+  /** PRODUCTION, FETTLING, STOCKTAKE or ADJUST. */
+  reference   String
+  referenceId String?
+  notes       String?
+
+  createdBy String
+  createdAt DateTime @default(now())
+
+  part Part @relation(fields: [partId], references: [id], onDelete: Cascade)
+
+  @@index([partId])
+  @@index([createdAt])
+  @@map("part_stage_logs")
 }
 
 // Aluminum inventory types enum
@@ -360,6 +534,18 @@ model ProductionRecord {
   batchNumber String   @unique
   // Optional so batches recorded before furnace tracking remain valid
   furnaceId   String?
+  /**
+   * The shop-floor employee who ran this heat.
+   *
+   * Different from createdBy, which is whoever typed it in - often a manager
+   * writing up someone else's shift. "Who was on the furnace" is the question
+   * asked when a batch looks wrong, and the login name does not answer it.
+   *
+   * Nullable because every batch recorded before this was asked for has no
+   * answer, and inventing one would be worse than leaving it blank. New
+   * batches must name an operator.
+   */
+  operatorId  String?
   date        DateTime @default(now())
 
   // Input
@@ -385,6 +571,42 @@ model ProductionRecord {
 
   // How far through the three entry stages this batch is
   status ProductionStatus @default(COMPLETED)
+
+  /**
+   * Metal still molten in the furnace when this batch closed, in grams.
+   *
+   * A heat is rarely poured out to the last kilo: 300 kg charged and 150 kg
+   * poured into moulds leaves 150 kg sitting in the furnace. That metal has
+   * ALREADY been taken out of inventory - it left stock when this batch was
+   * charged - so it is not stock and must never be booked as stock. It is
+   * simply recorded here, and the next heat on that furnace can claim it.
+   *
+   * Null on every batch recorded before this was tracked, which is honest:
+   * nobody wrote down what was left, and 0 would claim the furnace was run dry.
+   */
+  metalRemaining Float?
+
+  /**
+   * The batch whose leftover metal was melted into this one.
+   *
+   * Unique, so a given heel can only ever be claimed once - two batches both
+   * carrying the same 150 kg would invent metal out of nothing, and the
+   * database refuses it rather than trusting every code path to check.
+   */
+  carriedFromId String? @unique
+  carriedFrom   ProductionRecord? @relation("FurnaceHeel", fields: [carriedFromId], references: [id])
+  carriedTo     ProductionRecord? @relation("FurnaceHeel")
+
+  /**
+   * How much of that heel came in, in grams.
+   *
+   * Counts towards the charge but NOT towards any stock movement: the metal
+   * was deducted from inventory when the previous batch was charged, and
+   * deducting it again would take the same kilos out of stock twice. Defaults
+   * to 0, which is not a guess - every batch recorded before this feature
+   * genuinely carried nothing in.
+   */
+  carriedInWeight Float @default(0)
 
   // Output - batch totals, summed from the line items. Zero until the batch is
   // completed, because until then the castings have not been counted.
@@ -418,8 +640,9 @@ model ProductionRecord {
   updatedAt DateTime @updatedAt
 
   // Relations
-  user    User             @relation(fields: [createdBy], references: [id])
-  furnace Furnace?         @relation(fields: [furnaceId], references: [id])
+  user     User             @relation(fields: [createdBy], references: [id])
+  furnace  Furnace?         @relation(fields: [furnaceId], references: [id])
+  operator Employee?        @relation(fields: [operatorId], references: [id])
   items   ProductionItem[]
 
   @@map("production_records")

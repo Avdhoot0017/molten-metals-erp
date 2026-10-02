@@ -410,3 +410,23 @@ tr:hover {
   z-index: 9999;
   animation: slideUp 0.3s ease-out;
 }
+
+
+/*
+ * No spinner arrows on number fields.
+ *
+ * The little up/down arrows sit exactly where a thumb lands, and every value
+ * in this app is a weight or a count that someone typed off a scale or a
+ * tally - nudging one by a step is never what was meant. The field still
+ * refuses non-numeric text; it just cannot be stepped.
+ */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}

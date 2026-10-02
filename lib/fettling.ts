@@ -71,6 +71,7 @@ export const SHEET_LOCKED_MESSAGE =
  */
 export function rejectedScrapWeight(item: {
   partsRejected: number;
+  reworkQty?: number;
   rejectedWeight?: number | null;
   part: { weightPerPiece: number };
 }): number {
@@ -79,7 +80,18 @@ export function rejectedScrapWeight(item: {
   if (item.rejectedWeight !== null && item.rejectedWeight !== undefined) {
     return item.rejectedWeight;
   }
-  return item.partsRejected * item.part.weightPerPiece;
+  // Only the pieces that actually go into the furnace are scrap metal. One
+  // sent to the welding bench is still a casting, and booking it as scrap
+  // would put metal in stock that never went back in the melt.
+  return meltedFrom(item) * item.part.weightPerPiece;
+}
+
+/** How many of a line's rejects go to the melt rather than the repair bench. */
+export function meltedFrom(item: {
+  partsRejected: number;
+  reworkQty?: number;
+}): number {
+  return Math.max(0, item.partsRejected - (item.reworkQty ?? 0));
 }
 
 /**
@@ -99,6 +111,7 @@ export function rejectedScrapWeight(item: {
 export function fettlingScrapMovements(
   items: Array<{
     partsRejected: number;
+    reworkQty?: number;
     rejectedWeight?: number | null;
     part: { weightPerPiece: number; alloyGrade: string };
   }>
@@ -106,7 +119,7 @@ export function fettlingScrapMovements(
   const moves = new Map<AluminumType, number>();
 
   for (const item of items) {
-    if (item.partsRejected <= 0) continue;
+    if (meltedFrom(item) <= 0) continue;
     const weight = rejectedScrapWeight(item);
     if (weight <= 0) continue;
 

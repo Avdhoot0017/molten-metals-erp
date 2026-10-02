@@ -155,3 +155,112 @@ export function meltBalance(input: {
     message,
   };
 }
+
+/**
+ * What a batch's castings account for, worked out from the parts themselves.
+ *
+ * Every part carries a pouring weight and a finished weight, so once the
+ * counts are entered the metal is fully determined and nobody needs to work it
+ * out on paper:
+ *
+ *   poured        every casting at its pouring weight - what left the furnace
+ *   runnerRaiser  the gating cut off the castings that PASSED
+ *   rejectedPart  the castings that failed, gating and all
+ *   goodWeight    the bodies of the castings that passed
+ *
+ * The split between the middle two is the whole point. A casting rejected at
+ * the furnace is thrown in the scrap bin as it came out of the mould - nobody
+ * cuts the runners off a casting they are about to re-melt - so it goes back
+ * at its POURING weight, not at the weight of the part it was going to be. A
+ * 5 kg part poured at 10 kg is 10 kg of scrap when it fails, not 5.
+ *
+ * Only castings that are kept have their gating cut off, so only those
+ * contribute runner and riser scrap.
+ *
+ * The three outputs still add up to `poured` exactly:
+ *   good x finished + good x gating + rejected x pouring = poured
+ */
+export interface CastingOutput {
+  poured: number;
+  runnerRaiser: number;
+  rejectedPart: number;
+  goodWeight: number;
+  /** False when any line's part has no pouring weight, so nothing was assumed. */
+  complete: boolean;
+}
+
+export function castingOutput(
+  lines: Array<{
+    quantityProduced: number;
+    goodParts: number;
+    part: { weightPerPiece: number; pouringWeight: number | null };
+  }>
+): CastingOutput {
+  let poured = 0;
+  let runnerRaiser = 0;
+  let rejectedPart = 0;
+  let goodWeight = 0;
+  let complete = lines.length > 0;
+
+  for (const line of lines) {
+    const qty = line.quantityProduced;
+    const good = Math.min(line.goodParts, qty);
+    const rejected = qty - good;
+    const finished = line.part.weightPerPiece;
+
+    // No pouring weight means the gating was never measured for this part.
+    // Its castings still weigh what they weigh, but the metal poured and the
+    // gating coming back cannot be known, so the figures are marked incomplete
+    // rather than quietly understated.
+    const pouring = line.part.pouringWeight;
+    if (!pouring || pouring < finished) {
+      complete = false;
+      goodWeight += good * finished;
+      // Without a pouring weight the gating is unknown, so a failed casting
+      // can only be counted at the weight that IS known - understating it,
+      // which is why the figures are marked incomplete
+      rejectedPart += rejected * finished;
+      poured += qty * finished;
+      continue;
+    }
+
+    poured += qty * pouring;
+    // Gating comes back only from the castings somebody kept
+    runnerRaiser += good * (pouring - finished);
+    goodWeight += good * finished;
+    // A failed casting goes to the melt whole, runners and all
+    rejectedPart += rejected * pouring;
+  }
+
+  return { poured, runnerRaiser, rejectedPart, goodWeight, complete };
+}
+
+/**
+ * The metal a batch had to work with, in grams.
+ *
+ * Three sources, and the third is the one that catches people out: metal
+ * carried over from the previous heat is part of the charge but is NOT stock -
+ * it was deducted from inventory when that earlier batch was charged, and is
+ * still sitting in the furnace.
+ */
+export function chargeOf(record: {
+  aluminumUsed: number;
+  totalScrapUsed: number;
+  carriedInWeight?: number | null;
+}): number {
+  return (
+    record.aluminumUsed + record.totalScrapUsed + (record.carriedInWeight ?? 0)
+  );
+}
+
+/**
+ * What should still be in the furnace: everything charged, less everything
+ * poured into moulds.
+ *
+ * An estimate, and offered as one. Real heats lose metal to dross and
+ * oxidation, so the operator can correct it - and the difference between this
+ * figure and what they enter is exactly that loss.
+ */
+export function suggestedHeel(charge: number, poured: number): number {
+  return Math.max(0, charge - poured);
+}

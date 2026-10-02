@@ -93,6 +93,14 @@ const { searchParams } = new URL(request.url);
         isToday: date.getTime() === todayUtc().getTime(),
         editable: canEditSheetForDate(session, date),
         rows,
+        /*
+         * Operations, not pieces.
+         *
+         * Ten castings worked at two stations is twenty operations and ten
+         * pieces. Reporting this as "parts" is exactly how a day's work came
+         * to look like double the output, so it is named for what it measures.
+         */
+        totalOperations: rows.reduce((sum, r) => sum + (r.partsCompleted ?? 0), 0),
         totalParts: rows.reduce((sum, r) => sum + (r.partsCompleted ?? 0), 0),
         // Accepted is derived, never stored, so it cannot drift from the two
         // figures the operator actually typed

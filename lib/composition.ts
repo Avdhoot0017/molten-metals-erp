@@ -7,7 +7,19 @@
 
 export interface CompositionEntry {
   key: string;
+  /** The assay reading, stored with its unit - "12.1%". May be empty when
+   *  only an addition was made and the heat has not been re-assayed yet. */
   value: string;
+  /**
+   * Grams of this element added to the melt, when any were.
+   *
+   * A reading and an addition are different facts: one is what the spectro
+   * says the heat contains, the other is what was thrown in to get it there.
+   * Optional, and absent on every entry recorded before it was asked for -
+   * which is why it lives in the JSON column rather than a new one, so no
+   * stored batch has to be migrated or rewritten to gain it.
+   */
+  grams?: number;
 }
 
 export const MAX_COMPOSITION_ENTRIES = 50;
@@ -46,11 +58,25 @@ export function parseComposition(
     const key = String((raw as CompositionEntry).key ?? "").trim();
     const value = String((raw as CompositionEntry).value ?? "").trim();
 
+    // Grams added, if any. Absent and 0 are different: 0 says "nothing was
+    // added", absent says "nobody recorded an addition".
+    const rawGrams = (raw as CompositionEntry).grams;
+    let grams: number | undefined;
+    if (rawGrams !== undefined && rawGrams !== null && String(rawGrams).trim() !== "") {
+      const parsed = Number(rawGrams);
+      if (!Number.isFinite(parsed) || parsed < 0) {
+        return { entries: null, error: `Grams added for "${key}" must be a number of 0 or more` };
+      }
+      grams = parsed;
+    }
+
     if (!key) {
       return { entries: null, error: "Composition entries need a field name" };
     }
-    if (!value) {
-      return { entries: null, error: `Enter a value for "${key}"` };
+    // Either fact is worth keeping on its own: an addition can be recorded
+    // before the heat is re-assayed, and a reading needs no addition behind it
+    if (!value && grams === undefined) {
+      return { entries: null, error: `Enter a reading or an addition for "${key}"` };
     }
     if (key.length > MAX_FIELD_LENGTH || value.length > MAX_FIELD_LENGTH) {
       return {
@@ -66,7 +92,7 @@ export function parseComposition(
     }
     seen.add(dedupeKey);
 
-    entries.push({ key, value });
+    entries.push(grams === undefined ? { key, value } : { key, value, grams });
   }
 
   return { entries, error: null };
@@ -79,7 +105,13 @@ export function readComposition(value: unknown): CompositionEntry[] {
     if (typeof raw !== "object" || raw === null) return [];
     const key = String((raw as CompositionEntry).key ?? "").trim();
     const val = String((raw as CompositionEntry).value ?? "").trim();
-    return key && val ? [{ key, value: val }] : [];
+    const rawGrams = (raw as CompositionEntry).grams;
+    const grams =
+      rawGrams === undefined || rawGrams === null || !Number.isFinite(Number(rawGrams))
+        ? undefined
+        : Number(rawGrams);
+    if (!key || (!val && grams === undefined)) return [];
+    return [grams === undefined ? { key, value: val } : { key, value: val, grams }];
   });
 }
 
@@ -96,6 +128,15 @@ export function compositionToInputs(value: unknown): Record<string, string> {
   for (const entry of readComposition(value)) {
     const stripped = entry.value.replace(/%/g, "").trim();
     if (stripped) inputs[entry.key] = stripped;
+  }
+  return inputs;
+}
+
+/** The same, for the grams-added column. */
+export function compositionGramsToInputs(value: unknown): Record<string, string> {
+  const inputs: Record<string, string> = {};
+  for (const entry of readComposition(value)) {
+    if (entry.grams !== undefined) inputs[entry.key] = String(entry.grams);
   }
   return inputs;
 }
@@ -222,6 +263,8 @@ export function aluminiumBalance(values: Record<string, string>): AluminiumBalan
  */
 export function buildCompositionEntries(
   elementValues: Record<string, string>,
+  /** Grams added per element, as typed. Blank means none was recorded. */
+  gramValues: Record<string, string> = {},
   /**
    * Extra entries outside the LM6 table. The production form no longer offers
    * these, but older batches were saved with them and `parseComposition` still
@@ -235,7 +278,18 @@ export function buildCompositionEntries(
   // was auto-filled or typed by hand is a UI concern, not a storage one.
   for (const element of LM6_ELEMENTS) {
     const value = (elementValues[element.symbol] ?? "").trim();
-    if (value) entries.push({ key: element.symbol, value: `${value}%` });
+    const rawGrams = (gramValues[element.symbol] ?? "").trim();
+    const grams = rawGrams === "" ? undefined : Number(rawGrams);
+
+    // An element with neither a reading nor an addition was simply not
+    // measured, and a blank is not a zero
+    if (!value && (grams === undefined || !Number.isFinite(grams))) continue;
+
+    entries.push({
+      key: element.symbol,
+      value: value ? `${value}%` : "",
+      ...(grams !== undefined && Number.isFinite(grams) ? { grams } : {}),
+    });
   }
 
   return [...entries, ...custom];

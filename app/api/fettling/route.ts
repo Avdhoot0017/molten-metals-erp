@@ -12,8 +12,28 @@ import {
 } from "@/lib/fettling";
 import { formatWeight } from "@/lib/units";
 import { materialLabel } from "@/lib/ingot";
+import {
+  fettlingMoves,
+  stageDelta,
+  reverseMoves,
+  applyStageMoves,
+  describeStage,
+  type RouteStepRef,
+  type StageMoves,
+} from "@/lib/pieces";
 import type { AluminumType } from "@/types";
 import { Prisma } from "@prisma/client";
+
+/**
+ * A movement the shop floor will not allow: more pieces worked than are
+ * standing at the station, or scrap taken back that has already been melted.
+ *
+ * Thrown rather than returned because the checks run inside the transaction,
+ * where returning early would commit the half of it already written. It also
+ * carries its own message out to the operator, instead of being flattened into
+ * a generic 500 the way these refusals used to be.
+ */
+export class MovementRefused extends Error {}
 
 export interface NormalisedItem {
   partId: string;
@@ -21,6 +41,20 @@ export interface NormalisedItem {
   partsRejected: number;
   /** Weighed scrap in grams, or null to use count x the part's weight. */
   rejectedWeight: number | null;
+  /**
+   * The station in this part's route that this work belongs to.
+   *
+   * Null only for a part with no route, whose pieces are not tracked through
+   * the shop. Everything else is pinned to a step, which is what lets the
+   * entry move pieces along instead of inventing them.
+   */
+  routeStepId: string | null;
+  /** Of the rejects, how many went for repair rather than the melt. */
+  reworkQty: number;
+  /** Set when this line repairs rejects instead of working the route. */
+  reworkFromStepId: string | null;
+  /** Where repaired pieces rejoin the route. */
+  returnStepId: string | null;
 }
 
 /**
@@ -31,7 +65,9 @@ export interface NormalisedItem {
  * read, because the dashboard aggregates these across months.
  */
 export async function normaliseItems(
-  raw: unknown
+  raw: unknown,
+  /** The process this day's work was done on - decides which step each line is. */
+  activityTypeId: string
 ): Promise<
   | {
       ok: true;
@@ -40,6 +76,9 @@ export async function normaliseItems(
       rejected: number;
       /** Weight and alloy per part, for booking the rejected scrap. */
       parts: Map<string, { weightPerPiece: number; alloyGrade: string }>;
+      /** Each part's ordered route, for moving pieces along it. */
+      routes: Map<string, RouteStepRef[]>;
+      partCodes: Map<string, string>;
     }
   | { ok: false; error: string }
 > {
@@ -94,27 +133,180 @@ export async function normaliseItems(
       };
     }
 
+    // Of the rejects, how many are worth saving. Blank means none - which is
+    // what every entry recorded before rework existed meant.
+    const rework =
+      line.reworkQty === null || line.reworkQty === undefined || line.reworkQty === ""
+        ? 0
+        : Number(line.reworkQty);
+    if (!Number.isInteger(rework) || rework < 0) {
+      return { ok: false, error: "Pieces sent for rework must be a whole number of 0 or more" };
+    }
+    if (rework > rejected) {
+      return {
+        ok: false,
+        error: "More pieces sent for rework than were rejected",
+      };
+    }
+
+    /*
+     * Pieces going to the melt have to be weighed.
+     *
+     * This weight is added to rejected-part stock, so it is a stock figure and
+     * has to come off a scale. Count x the part's nominal weight was a
+     * reasonable stand-in while it was only a report; a casting rejected as a
+     * part-filled pour, or broken up before it reaches the bin, does not weigh
+     * what the drawing says.
+     */
+    if (rejected - rework > 0 && rejectedWeight === null) {
+      return {
+        ok: false,
+        error: `Weigh the ${rejected - rework} piece${rejected - rework === 1 ? "" : "s"} going to the melt - that weight is what goes into rejected-part stock`,
+      };
+    }
+
     items.push({
       partId: line.partId,
       partsCompleted: done,
       partsRejected: rejected,
       rejectedWeight,
-    });
+      reworkQty: rework,
+      // Filled in below, once the parts' routes have been read
+      routeStepId: null,
+      reworkFromStepId: null,
+      returnStepId: null,
+      // Carried through so the route resolution below can read them
+      source: typeof line.source === "string" ? line.source : null,
+      returnTo: typeof line.returnTo === "string" ? line.returnTo : null,
+    } as NormalisedItem & { source: string | null; returnTo: string | null });
   }
 
   const known = await prisma.part.findMany({
     where: { id: { in: items.map((i) => i.partId) } },
-    select: { id: true, weightPerPiece: true, alloyGrade: true },
+    select: {
+      id: true,
+      partCode: true,
+      weightPerPiece: true,
+      alloyGrade: true,
+      routeSteps: {
+        orderBy: { sequence: "asc" },
+        select: { id: true, sequence: true, activityTypeId: true },
+      },
+    },
   });
   if (known.length !== items.length) {
     return { ok: false, error: "Part not found" };
   }
 
+  /*
+   * Pin each line to the station in that part's route.
+   *
+   * This is what stops the double counting. Without a station, an entry is
+   * just a number that gets added up; with one, it is "these pieces moved from
+   * here to there", and the same ten pieces cannot be counted at two places.
+   */
+  const routes = new Map<string, RouteStepRef[]>();
+  const partCodes = new Map<string, string>();
+  for (const part of known) {
+    routes.set(part.id, part.routeSteps);
+    partCodes.set(part.id, part.partCode);
+  }
+  // Needed to name the offending station when a return step is refused
+  const processNames = await processNamesFor(routes);
+
+  for (const item of items) {
+    const line = item as NormalisedItem & {
+      source: string | null;
+      returnTo: string | null;
+    };
+    const route = routes.get(item.partId) ?? [];
+    const code = partCodes.get(item.partId) ?? "That part";
+
+    // A part with no route is not tracked through the shop. Its work is still
+    // recorded as labour; it simply moves no pieces.
+    if (route.length === 0) continue;
+
+    /*
+     * Two kinds of work happen at a bench, and they draw from different queues.
+     *
+     * Route work takes pieces from this station's own queue. Rework takes them
+     * from the reject queue of whichever station turned them down - a welder
+     * works on "the ones leak testing failed", which may not be a step of the
+     * route at all. The caller says which by naming the queue.
+     */
+    const isRework = line.source?.startsWith("REWORK:") ?? false;
+
+    if (isRework) {
+      const fromStepId = line.source!.slice("REWORK:".length);
+      const rejectedAt = route.find((s) => s.id === fromStepId);
+      if (!rejectedAt) {
+        return {
+          ok: false,
+          error: `That rework queue does not belong to ${code}`,
+        };
+      }
+      // A piece that failed rework is scrap. Sending it round the loop again
+      // inside one entry would be a line reworking its own output.
+      if (item.reworkQty > 0) {
+        return {
+          ok: false,
+          error: "A piece that cannot be saved at rework goes to the melt, not back to rework",
+        };
+      }
+
+      /*
+       * Where the repaired pieces rejoin the route - any station on it.
+       *
+       * A weld can undo work that has to be done again, or leave a casting
+       * ready for a later stage entirely, and only the person holding it knows
+       * which. So the choice is theirs: any step of this part's route, with
+       * the one that rejected them as the default.
+       *
+       * It has to be a step of THIS part's route, or the pieces would be put
+       * somewhere that does not exist for them.
+       */
+      const returnStepId = line.returnTo || fromStepId;
+      const returnStep = route.find((s) => s.id === returnStepId);
+      if (!returnStep) {
+        return { ok: false, error: `That return step does not belong to ${code}` };
+      }
+
+      item.reworkFromStepId = fromStepId;
+      item.returnStepId = returnStepId;
+      continue;
+    }
+
+    const step = route.find((s) => s.activityTypeId === activityTypeId);
+    if (!step) {
+      return {
+        ok: false,
+        error: `${code} does not go through this process. Add it to the part's route, or record this work against a part that does.`,
+      };
+    }
+    item.routeStepId = step.id;
+  }
+
+  // `source` and `returnTo` were only ever how the caller named a queue. The
+  // resolved step ids are what get stored, so the raw ones are dropped here -
+  // passing them through would be handing Prisma columns that do not exist.
+  const stored: NormalisedItem[] = items.map((i) => ({
+    partId: i.partId,
+    partsCompleted: i.partsCompleted,
+    partsRejected: i.partsRejected,
+    rejectedWeight: i.rejectedWeight,
+    reworkQty: i.reworkQty,
+    routeStepId: i.routeStepId,
+    reworkFromStepId: i.reworkFromStepId,
+    returnStepId: i.returnStepId,
+  }));
+
   return {
     ok: true,
-    items,
+    items: stored,
     completed: items.reduce((sum, i) => sum + i.partsCompleted, 0),
     rejected: items.reduce((sum, i) => sum + i.partsRejected, 0),
+    routes,
+    partCodes,
     parts: new Map(
       known.map((p) => [
         p.id,
@@ -124,11 +316,69 @@ export async function normaliseItems(
   };
 }
 
+/** Process names for the steps in these routes, so refusals name the station. */
+async function processNamesFor(
+  routes: Map<string, RouteStepRef[]>
+): Promise<Map<string, string>> {
+  const ids = new Set<string>();
+  for (const route of routes.values()) {
+    for (const step of route) ids.add(step.activityTypeId);
+  }
+  if (ids.size === 0) return new Map();
+  const types = await prisma.activityType.findMany({
+    where: { id: { in: [...ids] } },
+    select: { id: true, name: true },
+  });
+  return new Map(types.map((t) => [t.id, t.name]));
+}
+
+/**
+ * The piece movements an entry, as stored, is responsible for.
+ *
+ * Read back from the saved lines rather than recomputed from the request, so
+ * an amendment is measured against what is actually on the floor.
+ */
+async function pieceMovementsFor(activityId: string): Promise<{
+  moves: StageMoves;
+  routes: Map<string, RouteStepRef[]>;
+}> {
+  const items = await prisma.fettlingActivityItem.findMany({
+    where: { activityId },
+    select: {
+      partId: true,
+      partsCompleted: true,
+      partsRejected: true,
+      routeStepId: true,
+      reworkQty: true,
+      reworkFromStepId: true,
+      returnStepId: true,
+      part: {
+        select: {
+          routeSteps: {
+            orderBy: { sequence: "asc" },
+            select: { id: true, sequence: true, activityTypeId: true },
+          },
+        },
+      },
+    },
+  });
+
+  const routes = new Map<string, RouteStepRef[]>();
+  for (const item of items) routes.set(item.partId, item.part.routeSteps);
+
+  return { moves: fettlingMoves(items, routes), routes };
+}
+
 /** The rejected-scrap movements an entry, as stored, is responsible for. */
 async function movementsFor(activityId: string) {
   const items = await prisma.fettlingActivityItem.findMany({
     where: { activityId },
-    include: { part: { select: { weightPerPiece: true, alloyGrade: true } } },
+    select: {
+      partsRejected: true,
+      reworkQty: true,
+      rejectedWeight: true,
+      part: { select: { weightPerPiece: true, alloyGrade: true } },
+    },
   });
   return fettlingScrapMovements(items);
 }
@@ -363,7 +613,7 @@ if (!canRecordFettlingActivity(session)) {
       return NextResponse.json({ error: SHEET_LOCKED_MESSAGE }, { status: 403 });
     }
 
-    const parsed = await normaliseItems(items);
+    const parsed = await normaliseItems(items, bodyActivityTypeId);
     if (!parsed.ok) {
       return NextResponse.json({ error: parsed.error }, { status: 400 });
     }
@@ -424,6 +674,7 @@ if (!canRecordFettlingActivity(session)) {
       const moves = fettlingScrapMovements(
         parsed.items.map((i) => ({
           partsRejected: i.partsRejected,
+          reworkQty: i.reworkQty,
           rejectedWeight: i.rejectedWeight,
           part: parsed.parts.get(i.partId)!,
         }))
@@ -436,13 +687,40 @@ if (!canRecordFettlingActivity(session)) {
         created.id,
         session.id
       );
-      if (failure) throw new Error(failure);
+      if (failure) throw new MovementRefused(failure);
+
+      /*
+       * The pieces move along the route.
+       *
+       * This is the whole point of the entry: the same castings leave this
+       * station and arrive at the next one. They are not new pieces, which is
+       * what the old count-them-up approach assumed, and why ten castings
+       * through two stations read as twenty parts.
+       */
+      const processNames = await processNamesFor(parsed.routes);
+      const pieceRefusal = await applyStageMoves(
+        tx,
+        fettlingMoves(parsed.items, parsed.routes),
+        {
+          reference: "FETTLING",
+          referenceId: created.id,
+          notes: `${employee.name}, ${toDateOnlyString(workDate)}`,
+          userId: session.id,
+          describe: (partId, stageKey) =>
+            describeStage(stageKey, parsed.routes.get(partId) ?? [], processNames),
+          partLabel: (partId) => parsed.partCodes.get(partId) ?? "that part",
+        }
+      );
+      if (pieceRefusal) throw new MovementRefused(pieceRefusal);
 
       return created;
     });
 
     return NextResponse.json({ success: true, data: activity }, { status: 201 });
   } catch (error) {
+    if (error instanceof MovementRefused) {
+      return NextResponse.json({ error: error.message }, { status: 400 });
+    }
     console.error("Error recording fettling activity:", error);
     return NextResponse.json(
       { error: "Failed to record fettling activity" },
@@ -519,15 +797,22 @@ if (!canRecordFettlingActivity(session)) {
     // form always holds the whole day's work anyway.
     let parsed: Awaited<ReturnType<typeof normaliseItems>> | null = null;
     if (items !== undefined) {
-      parsed = await normaliseItems(items);
+      // The process may be changing in the same edit; the lines belong to
+      // whichever one the day is being saved as
+      parsed = await normaliseItems(
+        items,
+        putActivityTypeId ?? existing.activityTypeId
+      );
       if (!parsed.ok) {
         return NextResponse.json({ error: parsed.error }, { status: 400 });
       }
     }
 
     const updated = await prisma.$transaction(async (tx) => {
-      // What the entry was responsible for before it changed
+      // What the entry was responsible for before it changed - both the scrap
+      // it booked and the pieces it moved
       const before = await movementsFor(id);
+      const piecesBefore = await pieceMovementsFor(id);
 
       const result = await tx.fettlingActivity.update({
         where: { id },
@@ -563,6 +848,7 @@ if (!canRecordFettlingActivity(session)) {
         const after = fettlingScrapMovements(
           parsed.items.map((i) => ({
             partsRejected: i.partsRejected,
+            reworkQty: i.reworkQty,
             rejectedWeight: i.rejectedWeight,
             part: parsed.parts.get(i.partId)!,
           }))
@@ -575,7 +861,34 @@ if (!canRecordFettlingActivity(session)) {
           id,
           session.id
         );
-        if (failure) throw new Error(failure);
+        if (failure) throw new MovementRefused(failure);
+
+        /*
+         * Only the change in pieces is applied.
+         *
+         * Correcting 10 down to 6 hands 4 back to this station and takes 4 off
+         * the next one - and is refused if that station has already worked
+         * them, because those pieces are past the point where this entry can
+         * speak for them.
+         */
+        const piecesAfter = fettlingMoves(parsed.items, parsed.routes);
+        const routes = new Map([...piecesBefore.routes, ...parsed.routes]);
+        const processNames = await processNamesFor(routes);
+
+        const pieceRefusal = await applyStageMoves(
+          tx,
+          stageDelta(piecesBefore.moves, piecesAfter),
+          {
+            reference: "FETTLING",
+            referenceId: id,
+            notes: `Corrected - ${result.employee.name}, ${toDateOnlyString(result.date)}`,
+            userId: session.id,
+            describe: (partId, stageKey) =>
+              describeStage(stageKey, routes.get(partId) ?? [], processNames),
+            partLabel: (partId) => parsed.partCodes.get(partId) ?? "that part",
+          }
+        );
+        if (pieceRefusal) throw new MovementRefused(pieceRefusal);
       }
 
       return result;
@@ -583,13 +896,13 @@ if (!canRecordFettlingActivity(session)) {
 
     return NextResponse.json({ success: true, data: updated });
   } catch (error) {
-    console.error("Error updating fettling activity:", error);
-    // applyScrapDeltas refuses by throwing its reason, which is a 400 the
-    // operator can act on rather than an opaque server error
-    const reason = error instanceof Error ? error.message : "";
-    if (reason.includes("come back out of stock")) {
-      return NextResponse.json({ error: reason }, { status: 400 });
+    // A refusal carries its own reason - something the operator can act on,
+    // not a server fault. Matching on the message text used to be how this
+    // was told apart; the error type says it outright now.
+    if (error instanceof MovementRefused) {
+      return NextResponse.json({ error: error.message }, { status: 400 });
     }
+    console.error("Error updating fettling activity:", error);
     return NextResponse.json(
       { error: "Failed to update fettling activity" },
       { status: 500 }
@@ -640,6 +953,7 @@ if (!canRecordFettlingActivity(session)) {
       const reversal = new Map(
         [...before].map(([type, amount]) => [type, -amount] as const)
       );
+      const piecesBefore = await pieceMovementsFor(id);
 
       const employee = await tx.employee.findUnique({
         where: { id: existing.employeeId },
@@ -653,20 +967,45 @@ if (!canRecordFettlingActivity(session)) {
         id,
         session.id
       );
-      if (failure) throw new Error(failure);
+      if (failure) throw new MovementRefused(failure);
+
+      // The pieces go back to the station they were taken from. Refused if the
+      // next station has already worked them - undoing this entry would then
+      // be claiming pieces that have moved on.
+      const processNames = await processNamesFor(piecesBefore.routes);
+      const partCodes = new Map(
+        (
+          await tx.part.findMany({
+            where: { id: { in: [...piecesBefore.routes.keys()] } },
+            select: { id: true, partCode: true },
+          })
+        ).map((p) => [p.id, p.partCode])
+      );
+
+      const pieceRefusal = await applyStageMoves(
+        tx,
+        reverseMoves(piecesBefore.moves),
+        {
+          reference: "FETTLING",
+          referenceId: id,
+          notes: `Reversed - entry deleted`,
+          userId: session.id,
+          describe: (partId, stageKey) =>
+            describeStage(stageKey, piecesBefore.routes.get(partId) ?? [], processNames),
+          partLabel: (partId) => partCodes.get(partId) ?? "that part",
+        }
+      );
+      if (pieceRefusal) throw new MovementRefused(pieceRefusal);
 
       await tx.fettlingActivity.delete({ where: { id } });
     });
 
     return NextResponse.json({ success: true });
   } catch (error) {
-    console.error("Error deleting fettling activity:", error);
-    // applyScrapDeltas refuses by throwing its reason, which is a 400 the
-    // operator can act on rather than an opaque server error
-    const reason = error instanceof Error ? error.message : "";
-    if (reason.includes("come back out of stock")) {
-      return NextResponse.json({ error: reason }, { status: 400 });
+    if (error instanceof MovementRefused) {
+      return NextResponse.json({ error: error.message }, { status: 400 });
     }
+    console.error("Error deleting fettling activity:", error);
     return NextResponse.json(
       { error: "Failed to delete fettling activity" },
       { status: 500 }

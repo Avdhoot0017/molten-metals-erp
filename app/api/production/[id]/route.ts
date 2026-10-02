@@ -17,6 +17,15 @@ import {
 } from "@/lib/ingot";
 import type { AluminumType } from "@/types";
 import { Prisma } from "@prisma/client";
+import { castingOutput, chargeOf, suggestedHeel } from "@/lib/production";
+import {
+  productionMoves,
+  stageDelta,
+  applyStageMoves,
+  describeStage,
+  reverseMoves,
+  type RouteStepRef,
+} from "@/lib/pieces";
 
 /**
  * Every stock movement one batch is responsible for, as a net weight per
@@ -75,14 +84,68 @@ function batchMovements(batch: {
   return moves;
 }
 
+/**
+ * Thrown when a piece movement would leave a stage negative.
+ *
+ * An exception rather than a return value because the check happens inside the
+ * transaction, where returning would commit everything up to that point. This
+ * unwinds the lot.
+ */
+class PieceMoveRefused extends Error {}
+
+/** The ordered route of each part, keyed by part id. */
+async function routesFor(partIds: string[]): Promise<Map<string, RouteStepRef[]>> {
+  const steps = await prisma.partRouteStep.findMany({
+    where: { partId: { in: partIds } },
+    orderBy: { sequence: "asc" },
+    select: { id: true, partId: true, sequence: true, activityTypeId: true },
+  });
+  const byPart = new Map<string, RouteStepRef[]>();
+  for (const step of steps) {
+    const list = byPart.get(step.partId) ?? [];
+    list.push({ id: step.id, sequence: step.sequence, activityTypeId: step.activityTypeId });
+    byPart.set(step.partId, list);
+  }
+  return byPart;
+}
+
+/** Process names for the steps in these routes, for error messages. */
+async function processNamesFor(
+  routes: Map<string, RouteStepRef[]>
+): Promise<Map<string, string>> {
+  const ids = new Set<string>();
+  for (const route of routes.values()) {
+    for (const step of route) ids.add(step.activityTypeId);
+  }
+  if (ids.size === 0) return new Map();
+  const types = await prisma.activityType.findMany({
+    where: { id: { in: [...ids] } },
+    select: { id: true, name: true },
+  });
+  return new Map(types.map((t) => [t.id, t.name]));
+}
+
 const recordInclude = {
   items: {
     include: {
-      part: { select: { id: true, name: true, partCode: true, weightPerPiece: true } },
+      part: {
+        select: {
+          id: true,
+          name: true,
+          partCode: true,
+          weightPerPiece: true,
+          pouringWeight: true,
+        },
+      },
     },
   },
   furnace: { select: { id: true, name: true } },
+  operator: { select: { id: true, name: true, employeeCode: true } },
   user: { select: { name: true } },
+  // Where this heat's metal came from, and where its leftover went. Both ends
+  // are shown on the batch so a heel can be traced without another query.
+  carriedFrom: { select: { id: true, batchNumber: true } },
+  carriedTo: { select: { id: true, batchNumber: true } },
 } satisfies Prisma.ProductionRecordInclude;
 
 // GET - One production record
@@ -157,7 +220,9 @@ export async function PATCH(
 
     const record = await prisma.productionRecord.findUnique({
       where: { id },
-      include: { items: true },
+      // carriedTo says whether the next heat has already melted this batch's
+      // leftover metal, which decides whether that figure may still change
+      include: { items: true, carriedTo: { select: { batchNumber: true } } },
     });
     if (!record) {
       return NextResponse.json({ error: "Batch not found" }, { status: 404 });
@@ -183,15 +248,23 @@ export async function PATCH(
     if (stage === "melt") {
       return await recordMeltQuality(id, body, record.status);
     }
+    if (stage === "parts") {
+      return await completeBatch(id, record, body, session.id, { closing: false });
+    }
     if (stage === "complete") {
-      return await completeBatch(id, record, body, session.id);
+      return await completeBatch(id, record, body, session.id, { closing: true });
     }
 
     return NextResponse.json(
-      { error: 'Unknown stage - expected "melt", "complete" or "amend"' },
+      { error: 'Unknown stage - expected "melt", "parts", "complete" or "amend"' },
       { status: 400 }
     );
   } catch (error) {
+    // A refused piece movement is the operator being told something is wrong
+    // with the figures, not a server fault - it must not read as one
+    if (error instanceof PieceMoveRefused) {
+      return NextResponse.json({ error: error.message }, { status: 400 });
+    }
     console.error("Error updating production record:", error);
     return NextResponse.json(
       { error: "Failed to update production record" },
@@ -441,7 +514,7 @@ function parseMelt(body: Record<string, unknown>) {
  */
 async function amendBatch(
   id: string,
-  record: Prisma.ProductionRecordGetPayload<{ include: { items: true } }>,
+  record: Prisma.ProductionRecordGetPayload<{ include: { items: true; carriedTo: { select: { batchNumber: true } } } }>,
   body: Record<string, unknown>,
   userId: string
 ) {
@@ -632,11 +705,27 @@ async function recordMeltQuality(
  * Efficiency can only be worked out here, because it compares the metal
  * charged (known at stage 1) against the weight of good castings (known now).
  */
+/**
+ * The castings and the scrap, in one function because they are one sum.
+ *
+ * A heat is written up in two sittings: the castings are counted as they come
+ * off, and the scrap is weighed once it has been collected. Both figures are
+ * checked against the same charge, so splitting them into two functions would
+ * mean two copies of the same arithmetic drifting apart.
+ *
+ * `closing: false` records the castings and what is left in the furnace, and
+ * leaves the batch open. `closing: true` books the scrap and closes it.
+ */
 async function completeBatch(
   id: string,
   record: {
     aluminumUsed: number;
     totalScrapUsed: number;
+    carriedInWeight: number;
+    metalRemaining: number | null;
+    carriedTo: { batchNumber: string } | null;
+    /** What this batch already put on the floor, if it is being amended. */
+    items: Array<{ partId: string; quantityProduced: number; goodParts: number }>;
     ingotGrade: string;
     status: "PENDING" | "UPDATED" | "COMPLETED";
     runnerRaiserScrap: number;
@@ -645,19 +734,41 @@ async function completeBatch(
     notes: string | null;
   },
   body: Record<string, unknown>,
-  userId: string
+  userId: string,
+  { closing }: { closing: boolean }
 ) {
   const {
     items,
     runnerRaiserScrap,
     spillageScrap,
     rejectedPartScrap,
+    metalRemaining,
     notes,
   } = body;
 
-  if (!Array.isArray(items) || items.length === 0) {
+  /*
+   * The castings, from the request or from what was recorded earlier.
+   *
+   * Closing a batch asks only for the scrap - the castings were counted at the
+   * previous stage and are not on screen. Re-sending them would mean retyping
+   * figures the batch already holds.
+   */
+  const sentItems = Array.isArray(items) && items.length > 0 ? items : null;
+  const sourceItems =
+    sentItems ??
+    record.items.map((i) => ({
+      partId: i.partId,
+      quantityProduced: i.quantityProduced,
+      goodParts: i.goodParts,
+    }));
+
+  if (sourceItems.length === 0) {
     return NextResponse.json(
-      { error: "At least one part is required to complete a batch" },
+      {
+        error: closing
+          ? "Count the castings before closing this batch"
+          : "At least one part is required",
+      },
       { status: 400 }
     );
   }
@@ -670,7 +781,7 @@ async function completeBatch(
     rejectedParts: number;
   }> = [];
 
-  for (const item of items) {
+  for (const item of sourceItems) {
     if (!item?.partId) {
       return NextResponse.json(
         { error: "Every line needs a part" },
@@ -717,9 +828,16 @@ async function completeBatch(
   }
   const partById = new Map(parts.map((p) => [p.id, p]));
 
-  const runnerRaiserScrapNum = parseFloat(String(runnerRaiserScrap)) || 0;
-  const spillageScrapNum = parseFloat(String(spillageScrap)) || 0;
-  const rejectedPartScrapNum = parseFloat(String(rejectedPartScrap)) || 0;
+  /*
+   * Scrap is only weighed at the closing stage. Recording the castings must
+   * leave whatever scrap the batch already has alone - reading a missing field
+   * as 0 would wipe it.
+   */
+  const keep = (sent: unknown, current: number) =>
+    closing || sent !== undefined ? parseFloat(String(sent)) || 0 : current;
+  const runnerRaiserScrapNum = keep(runnerRaiserScrap, record.runnerRaiserScrap);
+  const spillageScrapNum = keep(spillageScrap, record.spillageScrap);
+  const rejectedPartScrapNum = keep(rejectedPartScrap, record.rejectedPartScrap);
 
   for (const [label, value] of [
     ["Runner & raiser", runnerRaiserScrapNum],
@@ -732,6 +850,94 @@ async function completeBatch(
         { status: 400 }
       );
     }
+  }
+
+  // What the castings account for, from the parts' own weights. Used to work
+  // out what is left in the furnace once they have been poured.
+  const output = castingOutput(
+    normalisedItems.map((i) => ({
+      quantityProduced: i.quantityProduced,
+      goodParts: i.goodParts,
+      part: {
+        weightPerPiece: partById.get(i.partId)?.weightPerPiece ?? 0,
+        pouringWeight: partById.get(i.partId)?.pouringWeight ?? null,
+      },
+    }))
+  );
+
+  const charge = chargeOf(record);
+
+  /**
+   * Metal still in the furnace when this batch closed.
+   *
+   * Everything charged less everything poured, unless the operator says
+   * otherwise - they can see the furnace and the estimate cannot account for
+   * dross. Either way it moves no stock: this metal left inventory when the
+   * batch was charged and has not come back.
+   */
+  const heelGiven =
+    metalRemaining !== undefined &&
+    metalRemaining !== null &&
+    metalRemaining !== "";
+  const heel = heelGiven
+    ? parseFloat(String(metalRemaining))
+    // Not on screen when closing, so what was recorded with the castings
+    // stands; a batch that never had one falls back to the calculation
+    : record.metalRemaining ?? suggestedHeel(charge, output.poured);
+
+  if (!Number.isFinite(heel) || heel < 0) {
+    return NextResponse.json(
+      { error: "Metal left in the furnace cannot be negative" },
+      { status: 400 }
+    );
+  }
+  if (heel > charge) {
+    return NextResponse.json(
+      {
+        error: `More metal left in the furnace (${formatWeight(heel)}) than went into it (${formatWeight(charge)})`,
+      },
+      { status: 400 }
+    );
+  }
+  /*
+   * The LEFTOVER is what this defends, not the casting count.
+   *
+   * Parts that need more metal than went in are usually a miscount, but not
+   * always - metal gets added from another furnace, a drawing weight is wrong -
+   * and the operator is the one who knows. The form asks them for a note and
+   * saves what they say.
+   *
+   * Metal still in the furnace is different: the next heat is charged with it
+   * as real metal. Claiming a leftover that the castings have already used up
+   * would hand the next batch kilos that do not exist, so that is refused
+   * whoever says it. Checking the pair also catches an amendment that leaves
+   * the leftover alone and doubles the castings underneath it.
+   */
+  if (heel > 0 && output.poured + heel > charge + 1) {
+    const claimed = record.carriedTo
+      ? ` Batch ${record.carriedTo.batchNumber} is already using that leftover, so correct this batch or amend that one first.`
+      : "";
+    return NextResponse.json(
+      {
+        error: `The parts use ${formatWeight(output.poured)} of metal and ${formatWeight(heel)} is said to be left in the furnace, but only ${formatWeight(charge)} went in. Lower one of them.${claimed}`,
+      },
+      { status: 400 }
+    );
+  }
+
+  // Changing the leftover after the next heat has already melted it would
+  // rewrite that batch's charge behind its back
+  if (
+    record.carriedTo &&
+    record.metalRemaining !== null &&
+    heel !== record.metalRemaining
+  ) {
+    return NextResponse.json(
+      {
+        error: `Batch ${record.carriedTo.batchNumber} has already melted this leftover metal, so it cannot be changed. Amend that batch first.`,
+      },
+      { status: 400 }
+    );
   }
 
   // Batch totals rolled up from the lines
@@ -747,9 +953,11 @@ async function completeBatch(
     (sum, i) => sum + i.goodParts * (partById.get(i.partId)?.weightPerPiece ?? 0),
     0
   );
-  // Everything charged into the furnace counts as input, so the scrap that was
-  // re-melted at stage 1 is included alongside the fresh ingot.
-  const meltInput = record.aluminumUsed + record.totalScrapUsed;
+  // Everything charged into the furnace counts as input: the fresh ingot, the
+  // scrap re-melted at stage 1, and any metal carried over from the previous
+  // heat. Metal left behind was never available to this batch's castings, so it
+  // comes off the input rather than counting against it.
+  const meltInput = charge - heel;
   const efficiency = meltInput > 0 ? (expectedOutput / meltInput) * 100 : 0;
 
 
@@ -782,6 +990,37 @@ async function completeBatch(
     }
   }
 
+  /*
+   * Good castings become pieces on the shop floor, waiting at the first
+   * station of each part's route.
+   *
+   * Rejected castings do not: they were scrapped at the furnace and booked as
+   * metal, so they never became pieces. A part with no route has nothing
+   * defined to do to it, so its castings go straight to finished stock.
+   *
+   * On an amendment only the difference moves, so correcting 10 good to 8
+   * takes 2 back out - and is refused if a station has already worked them.
+   */
+  const routes = await routesFor(normalisedItems.map((i) => i.partId));
+  const processNames = await processNamesFor(routes);
+  /*
+   * What this batch has already put on the floor.
+   *
+   * Keyed on whether castings were recorded, not on whether the batch is
+   * closed: they are now counted at their own stage, so an open batch can
+   * already have pieces standing at a station. Reading this as "nothing"
+   * would book the same castings a second time when the batch is closed.
+   */
+  const pieceBefore =
+    record.items.length > 0
+      ? productionMoves(
+          record.items.map((i) => ({ partId: i.partId, goodParts: i.goodParts })),
+          routes
+        )
+      : new Map();
+  const pieceAfter = productionMoves(normalisedItems, routes);
+  const pieceDeltas = stageDelta(pieceBefore, pieceAfter);
+
   const result = await prisma.$transaction(async (tx) => {
     // Replace the lines outright: completing a batch is the first time parts
     // are recorded, and re-running it should not double them up.
@@ -790,7 +1029,18 @@ async function completeBatch(
     const updated = await tx.productionRecord.update({
       where: { id },
       data: {
-        status: "COMPLETED",
+        /*
+         * The castings stage leaves the batch open - there is more to come -
+         * but it is no longer merely charged, so a batch that was still
+         * PENDING moves on. Leaving it there would have the list saying
+         * "nothing known but the charge" about a heat whose castings are
+         * counted and whose leftover metal the next heat can already claim.
+         */
+        status: closing
+          ? "COMPLETED"
+          : record.status === "PENDING"
+          ? "UPDATED"
+          : record.status,
         items: { create: normalisedItems },
         quantityProduced: quantityProducedNum,
         goodParts: goodPartsNum,
@@ -798,6 +1048,7 @@ async function completeBatch(
         runnerRaiserScrap: runnerRaiserScrapNum,
         spillageScrap: spillageScrapNum,
         rejectedPartScrap: rejectedPartScrapNum,
+        metalRemaining: heel,
         totalScrap,
         efficiency,
         ...(typeof notes === "string" ? { notes: notes || null } : {}),
@@ -859,6 +1110,17 @@ async function completeBatch(
       });
     }
 
+    const refusal = await applyStageMoves(tx, pieceDeltas, {
+      reference: "PRODUCTION",
+      referenceId: id,
+      notes: `Good castings from batch ${updated.batchNumber}`,
+      userId,
+      describe: (partId, stageKey) =>
+        describeStage(stageKey, routes.get(partId) ?? [], processNames),
+      partLabel: (partId) => partById.get(partId)?.partCode ?? "that part",
+    });
+    if (refusal) throw new PieceMoveRefused(refusal);
+
     return updated;
   });
 
@@ -897,11 +1159,41 @@ export async function DELETE(
     const { id } = await ctx.params;
     const record = await prisma.productionRecord.findUnique({
       where: { id },
-      include: { items: true },
+      include: { items: true, carriedTo: { select: { batchNumber: true } } },
     });
     if (!record) {
       return NextResponse.json({ error: "Batch not found" }, { status: 404 });
     }
+
+    // A later heat is built on the metal this one left behind. Deleting it
+    // would leave that batch charged with metal from a batch that no longer
+    // exists - so the later one has to go, or be amended, first.
+    if (record.carriedTo) {
+      return NextResponse.json(
+        {
+          error: `Batch ${record.carriedTo.batchNumber} was charged with the metal this batch left in the furnace. Delete or amend that batch first.`,
+        },
+        { status: 400 }
+      );
+    }
+
+    // What this batch put on the shop floor, so it can be taken back off
+    const routes = await routesFor(record.items.map((i) => i.partId));
+    const processNames = await processNamesFor(routes);
+    // Castings are recorded before the batch closes, so an open batch may
+    // have put pieces on the floor that have to come back off
+    const pieceMoves =
+      record.items.length > 0
+        ? productionMoves(record.items, routes)
+        : new Map();
+    const partCodes = new Map(
+      (
+        await prisma.part.findMany({
+          where: { id: { in: record.items.map((i) => i.partId) } },
+          select: { id: true, partCode: true },
+        })
+      ).map((p) => [p.id, p.partCode])
+    );
 
     // Undo exactly what this batch did: the reverse of its own movements
     const moves = batchMovements(record);
@@ -953,6 +1245,20 @@ export async function DELETE(
         });
       }
 
+      // The castings this batch put on the floor come back off it. Refused if
+      // a station has already worked them - those pieces are past the point
+      // where deleting the batch can pretend they never existed.
+      const pieceRefusal = await applyStageMoves(tx, reverseMoves(pieceMoves), {
+        reference: "PRODUCTION",
+        referenceId: id,
+        notes: `Reversed - production batch ${record.batchNumber} was deleted`,
+        userId: session.id,
+        describe: (partId, stageKey) =>
+          describeStage(stageKey, routes.get(partId) ?? [], processNames),
+        partLabel: (partId) => partCodes.get(partId) ?? "that part",
+      });
+      if (pieceRefusal) throw new PieceMoveRefused(pieceRefusal);
+
       // The line items go with it; the log entries above deliberately do not
       await tx.productionItem.deleteMany({ where: { productionRecordId: id } });
       await tx.productionRecord.delete({ where: { id } });
@@ -963,6 +1269,9 @@ export async function DELETE(
       message: `Batch ${record.batchNumber} deleted and its metal returned to stock`,
     });
   } catch (error) {
+    if (error instanceof PieceMoveRefused) {
+      return NextResponse.json({ error: error.message }, { status: 400 });
+    }
     console.error("Error deleting production record:", error);
     return NextResponse.json(
       { error: "Failed to delete production record" },
