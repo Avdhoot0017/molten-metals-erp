@@ -21,6 +21,7 @@ import {
   HardHat,
   ClipboardList,
   Loader2,
+  Workflow,
 } from "lucide-react";
 import type { UserRole } from "@/types";
 import { can, type Resource } from "@/lib/permissions";
@@ -42,6 +43,9 @@ const navItems: NavItem[] = [
   // Fettling shop
   { label: "Employees", href: "/employees", icon: HardHat, resource: "employees" },
   { label: "Fettling Activity", href: "/fettling", icon: ClipboardList, resource: "fettling" },
+  // Where the pieces are - reads the same stage balances the fettling entries
+  // move, so it is behind the same permission
+  { label: "Shop Floor", href: "/shop-floor", icon: Workflow, resource: "fettling" },
   // Commercial
   { label: "Companies", href: "/companies", icon: Building2, resource: "companies" },
   { label: "Purchase Orders", href: "/purchase-orders", icon: ShoppingCart, resource: "purchaseOrders" },

@@ -101,7 +101,14 @@ interface DashboardData {
     /** Rejected at the furnace, and at the fettling bench. */
     castingRejects: number;
     fettlingRejects: number;
-    fettlingHandled: number;
+    /** Bench operations - work done, not pieces. */
+    fettlingOperations: number;
+    /** Pieces waiting at a station right now. */
+    piecesInProcess: number;
+    /** Pieces on the repair bench. */
+    piecesInRework: number;
+    /** Pieces through the whole route - finished stock. */
+    piecesReady: number;
     /** What those rejects weigh, at this part's own weight per piece. */
     rejectedWeight: number;
   }>;
@@ -426,21 +433,27 @@ export default function DashboardPage() {
                 No active parts
               </div>
             ) : (
-              <div className="overflow-x-auto">
+              /* A fixed height with the header pinned: the list grows with
+                 the catalogue, and a table that pushes everything below it off
+                 the page is no longer a dashboard. */
+              <div className="max-h-[28rem] overflow-auto rounded-lg border border-[var(--border)]">
                 <table className="w-full">
-                  <thead>
+                  <thead className="sticky top-0 z-10 bg-[var(--card)]">
                     <tr className="border-b border-[var(--border)]">
-                      <th className="text-left py-3 px-4 font-semibold text-sm">Part Number</th>
-                      <th className="text-left py-3 px-4 font-semibold text-sm">Part Name</th>
-                      <th className="text-right py-3 px-4 font-semibold text-sm">Weight / pc</th>
-                      <th className="text-left py-3 px-4 font-semibold text-sm">Alloy</th>
-                      <th className="text-right py-3 px-4 font-semibold text-sm">Batches</th>
-                      <th className="text-right py-3 px-4 font-semibold text-sm">Produced</th>
-                      <th className="text-right py-3 px-4 font-semibold text-sm">Good</th>
-                      <th className="text-right py-3 px-4 font-semibold text-sm">Rejected</th>
-                      <th className="text-right py-3 px-4 font-semibold text-sm">Aluminium Used</th>
-                      <th className="text-right py-3 px-4 font-semibold text-sm">Scrap</th>
-                      <th className="text-right py-3 px-4 font-semibold text-sm">Efficiency</th>
+                      {/* Short, plain headings, one line each. "Cast",
+                          "Ready weight" and "Aluminium Used" wrapped on a
+                          laptop and pushed the rows two lines tall. */}
+                      <th className="whitespace-nowrap px-4 py-3 text-left text-sm font-semibold">Part</th>
+                      <th className="whitespace-nowrap px-4 py-3 text-left text-sm font-semibold">Weight</th>
+                      <th className="whitespace-nowrap px-4 py-3 text-left text-sm font-semibold">Alloy</th>
+                      <th className="whitespace-nowrap px-4 py-3 text-left text-sm font-semibold">Made</th>
+                      <th className="whitespace-nowrap px-4 py-3 text-left text-sm font-semibold">In shop</th>
+                      <th className="whitespace-nowrap px-4 py-3 text-left text-sm font-semibold">Repair</th>
+                      <th className="whitespace-nowrap px-4 py-3 text-left text-sm font-semibold">Ready</th>
+                      <th className="whitespace-nowrap px-4 py-3 text-left text-sm font-semibold">Stock</th>
+                      <th className="whitespace-nowrap px-4 py-3 text-left text-sm font-semibold">Scrapped</th>
+                      <th className="whitespace-nowrap px-4 py-3 text-left text-sm font-semibold">Metal used</th>
+                      <th className="whitespace-nowrap px-4 py-3 text-left text-sm font-semibold">Efficiency</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -449,50 +462,85 @@ export default function DashboardPage() {
                         key={part.id}
                         className="border-b border-[var(--border)] hover:bg-[var(--muted)]"
                       >
-                        <td className="py-3 px-4">
-                          <span className="font-mono text-sm bg-[var(--muted)] px-2 py-1 rounded">
-                            {part.partCode}
-                          </span>
+                        {/* The code is how a part is identified but not how it
+                            is read, so it moves onto the name as a tooltip and
+                            frees a column */}
+                        <td
+                          className="py-3 px-4 font-medium"
+                          title={`${part.partCode} - ${part.name}`}
+                        >
+                          {part.name}
                         </td>
-                        <td className="py-3 px-4 font-medium">{part.name}</td>
-                        <td className="py-3 px-4 text-right text-sm">
+                        <td className="whitespace-nowrap py-3 px-4 text-sm">
                           {formatWeight(part.weightPerPiece)}
                         </td>
-                        <td className="py-3 px-4 text-sm">{part.alloyGrade}</td>
-                        <td className="py-3 px-4 text-right text-sm">{part.batches}</td>
-                        <td className="py-3 px-4 text-right font-medium">
+                        <td className="whitespace-nowrap py-3 px-4 text-sm">{part.alloyGrade}</td>
+                        {/* Castings ever poured, against where those pieces
+                            are now. Good and rejected counts said what
+                            happened; these say what the shop actually holds. */}
+                        <td className="whitespace-nowrap py-3 px-4 font-medium">
                           {part.quantityProduced.toLocaleString("en-IN")}
                         </td>
-                        <td className="py-3 px-4 text-right text-sm text-green-700">
-                          {part.goodParts.toLocaleString("en-IN")}
-                        </td>
-                        <td className="py-3 px-4 text-right text-sm">
-                          <span className={part.rejectedParts > 0 ? "text-red-600" : ""}>
-                            {part.rejectedParts.toLocaleString("en-IN")}
-                          </span>
-                          {part.rejectionRate > 0 && (
-                            <span className="text-[var(--muted-foreground)] ml-1">
-                              ({part.rejectionRate.toFixed(1)}%)
+                        <td className="whitespace-nowrap py-3 px-4 text-sm">
+                          {part.piecesInProcess > 0 ? (
+                            <span className="font-medium text-blue-700">
+                              {part.piecesInProcess.toLocaleString("en-IN")}
                             </span>
-                          )}
-                          {/* Where it failed matters more than the total: at
-                              the furnace is a melt problem, at the bench is a
-                              finishing one */}
-                          {part.rejectedParts > 0 && (
-                            <span className="block text-xs text-[var(--muted-foreground)]">
-                              {part.castingRejects} casting &middot;{" "}
-                              {part.fettlingRejects} fettling &middot;{" "}
-                              {formatWeight(part.rejectedWeight)}
-                            </span>
+                          ) : (
+                            <span className="text-[var(--muted-foreground)]">0</span>
                           )}
                         </td>
-                        <td className="py-3 px-4 text-right text-sm">
+                        <td className="whitespace-nowrap py-3 px-4 text-sm">
+                          {part.piecesInRework > 0 ? (
+                            <span className="font-medium text-amber-700">
+                              {part.piecesInRework.toLocaleString("en-IN")}
+                            </span>
+                          ) : (
+                            <span className="text-[var(--muted-foreground)]">0</span>
+                          )}
+                        </td>
+                        <td className="whitespace-nowrap py-3 px-4 text-sm">
+                          {part.piecesReady > 0 ? (
+                            <span className="font-semibold text-green-700">
+                              {part.piecesReady.toLocaleString("en-IN")}
+                            </span>
+                          ) : (
+                            <span className="text-[var(--muted-foreground)]">0</span>
+                          )}
+                        </td>
+                        {/* The same stock as metal - what those finished
+                            castings weigh on the shelf */}
+                        <td className="whitespace-nowrap py-3 px-4 text-sm">
+                          {formatWeight(part.piecesReady * part.weightPerPiece)}
+                        </td>
+                        {/* Where it failed still matters - at the furnace is
+                            a melt problem, at the bench a finishing one - but
+                            it rides on the tooltip rather than a second line */}
+                        <td
+                          className="whitespace-nowrap px-4 py-3 text-sm"
+                          title={
+                            part.rejectedParts > 0
+                              ? `${part.castingRejects} at the furnace, ${part.fettlingRejects} at the bench - ${part.rejectionRate.toFixed(1)}% of what was made`
+                              : undefined
+                          }
+                        >
+                          {part.rejectedParts > 0 ? (
+                            <>
+                              <span className="text-red-600">
+                                {part.rejectedParts.toLocaleString("en-IN")}
+                              </span>
+                              <span className="ml-1 text-[var(--muted-foreground)]">
+                                {formatWeight(part.rejectedWeight)}
+                              </span>
+                            </>
+                          ) : (
+                            <span className="text-[var(--muted-foreground)]">0</span>
+                          )}
+                        </td>
+                        <td className="whitespace-nowrap px-4 py-3 text-sm">
                           {formatWeight(part.aluminumUsed)}
                         </td>
-                        <td className="py-3 px-4 text-right text-sm">
-                          {formatWeight(part.totalScrap)}
-                        </td>
-                        <td className="py-3 px-4 text-right">
+                        <td className="whitespace-nowrap py-3 px-4">
                           {part.batches > 0 ? (
                             <Badge
                               variant={

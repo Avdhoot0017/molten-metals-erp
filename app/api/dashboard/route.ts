@@ -236,30 +236,87 @@ export async function GET() {
     // and counting only the latter flattered every part's rejection rate.
     const fettlingByPart = await prisma.fettlingActivityItem.groupBy({
       by: ["partId"],
-      _sum: { partsCompleted: true, partsRejected: true },
+      _sum: { partsCompleted: true, partsRejected: true, reworkQty: true },
     });
     const fettlingFor = new Map(
       fettlingByPart.map((row) => [
         row.partId,
         {
-          handled: row._sum.partsCompleted ?? 0,
-          rejected: row._sum.partsRejected ?? 0,
+          /**
+           * Operations performed, NOT pieces.
+           *
+           * Ten castings through three stations is thirty operations and ten
+           * pieces. This figure used to be reported as the piece count, which
+           * is the whole reason a day's work looked like it tripled stock. It
+           * is kept because it is the right answer to "how much work was
+           * done", and it is named accordingly everywhere it surfaces.
+           */
+          operations: row._sum.partsCompleted ?? 0,
+          /**
+           * Times a piece was turned down - not pieces lost.
+           *
+           * One casting can be rejected twice: failed at leak testing, sent to
+           * the welding bench, and failed there too. Counting these as losses
+           * would be the same double count in another place.
+           */
+          rejectEvents: row._sum.partsRejected ?? 0,
+          /** Pieces that actually went to the melt: rejected, minus repaired. */
+          scrapped:
+            (row._sum.partsRejected ?? 0) - (row._sum.reworkQty ?? 0),
         },
       ])
     );
+
+    /*
+     * Where the pieces actually are.
+     *
+     * Read from the stage balances rather than summed from activity, so a
+     * piece counts once no matter how many hands it passed through.
+     */
+    const stageRows = await prisma.partStage.findMany({
+      where: { quantity: { not: 0 } },
+      select: { partId: true, kind: true, quantity: true },
+    });
+    const piecesFor = new Map<
+      string,
+      { inProcess: number; inRework: number; ready: number }
+    >();
+    for (const row of stageRows) {
+      const current =
+        piecesFor.get(row.partId) ?? { inProcess: 0, inRework: 0, ready: 0 };
+      if (row.kind === "WAITING") current.inProcess += row.quantity;
+      else if (row.kind === "REWORK") current.inRework += row.quantity;
+      else current.ready += row.quantity;
+      piecesFor.set(row.partId, current);
+    }
 
     const partAnalytics = activeParts.map((part) => {
       const agg = rollupByPart.get(part.id);
       const produced = agg?.quantityProduced ?? 0;
       const castingRejects = agg?.rejectedParts ?? 0;
-      const fettling = fettlingFor.get(part.id) ?? { handled: 0, rejected: 0 };
+      const fettling =
+        fettlingFor.get(part.id) ?? { operations: 0, rejectEvents: 0, scrapped: 0 };
+      const pieces =
+        piecesFor.get(part.id) ?? { inProcess: 0, inRework: 0, ready: 0 };
 
-      // Every piece that failed, wherever it failed
-      const rejected = castingRejects + fettling.rejected;
-      // The rate is against what was actually inspected - castings produced,
-      // plus anything the fettling bench handled that the casting count does
-      // not already cover
-      const inspected = Math.max(produced, fettling.handled);
+      /*
+       * Pieces lost, wherever they were lost.
+       *
+       * Counted as pieces that went to the melt, not as times something was
+       * rejected: a casting that failed a leak test and was then saved by a
+       * weld is not a loss at all, and one that failed both was lost once.
+       */
+      const rejected = castingRejects + Math.max(0, fettling.scrapped);
+      /*
+       * The rejection rate is measured against castings produced.
+       *
+       * It used to be measured against the larger of that and the number of
+       * fettling operations, which flattered every part: a casting handled at
+       * three stations counted three times in the denominator and once in the
+       * numerator. Pieces produced is the only figure that means "castings
+       * that existed to be judged".
+       */
+      const inspected = produced;
 
       return {
         id: part.id,
@@ -277,10 +334,30 @@ export async function GET() {
         rejectedParts: rejected,
         // Split out, because "where is it failing" is the useful question
         castingRejects,
-        fettlingRejects: fettling.rejected,
-        fettlingHandled: fettling.handled,
-        /** What the rejected castings weigh, at this part's own weight. */
-        rejectedWeight: rejected * part.weightPerPiece,
+        /** Pieces sent to the melt from the benches. */
+        fettlingRejects: Math.max(0, fettling.scrapped),
+        /** Times a piece was turned down, which may exceed pieces lost. */
+        fettlingRejectEvents: fettling.rejectEvents,
+        /** Operations at the benches - work done, not pieces. */
+        fettlingOperations: fettling.operations,
+        /** Pieces standing at a station, waiting to be worked. */
+        piecesInProcess: pieces.inProcess,
+        /** Pieces on the repair bench, not yet saved or scrapped. */
+        piecesInRework: pieces.inRework,
+        /** Pieces through the whole route - finished stock. */
+        piecesReady: pieces.ready,
+        /**
+         * What the lost pieces weigh.
+         *
+         * Weighed differently depending on where they failed, because they
+         * physically are different: a casting rejected at the furnace is
+         * scrapped as it came out of the mould, runners and all, so it goes
+         * back at its pouring weight. One rejected at a bench has already had
+         * its gating cut off, so only the part itself is left.
+         */
+        rejectedWeight:
+          castingRejects * (part.pouringWeight || part.weightPerPiece) +
+          Math.max(0, fettling.scrapped) * part.weightPerPiece,
         aluminumUsed: agg?.aluminumUsed ?? 0,
         totalScrap: agg?.totalScrap ?? 0,
         avgEfficiency:

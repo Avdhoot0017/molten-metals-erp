@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import {
+  ArrowRight,
   Factory,
   Plus,
   Search,
@@ -46,6 +47,7 @@ import {
 import {
   readComposition,
   compositionToInputs,
+  compositionGramsToInputs,
   buildCompositionEntries,
   aluminiumBalance,
   checkElementValue,
@@ -66,7 +68,7 @@ import {
  */
 /** Title, blurb and button for each of the three entry stages. */
 const MODAL_COPY: Record<
-  "create" | "melt" | "complete" | "amend",
+  "create" | "melt" | "parts" | "complete" | "amend",
   { title: string; description: string; action: string }
 > = {
   amend: {
@@ -85,9 +87,15 @@ const MODAL_COPY: Record<
     description: "Add the composition and density index for this heat.",
     action: "Save Reading",
   },
+  parts: {
+    title: "Castings Poured",
+    description:
+      "Count the castings off this heat and what is left in the furnace.",
+    action: "Save Castings",
+  },
   complete: {
     title: "Complete Batch",
-    description: "Count the castings and book the scrap this batch produced.",
+    description: "Weigh the scrap this batch produced and close it.",
     action: "Complete Batch",
   },
 };
@@ -101,7 +109,13 @@ const SCRAP_USED_FIELD: Record<
   REJECTED_PART: "rejectedPartScrapUsed",
 };
 import type { AluminumType } from "@/types";
-import { MAX_OPEN_BATCHES_PER_FURNACE } from "@/lib/production";
+import {
+  MAX_OPEN_BATCHES_PER_FURNACE,
+  castingOutput,
+  chargeOf,
+  suggestedHeel,
+} from "@/lib/production";
+import { announcePiecesChanged } from "@/lib/live-updates";
 import {
   parseWeightInput,
   weightForExport,
@@ -109,6 +123,27 @@ import {
   WEIGHT_UNIT,
 } from "@/lib/units";
 import { expectedScrapOf } from "@/lib/parts";
+
+/**
+ * How much metal one casting of this part takes out of the furnace.
+ *
+ * The pouring weight, because the gating is poured with the casting and comes
+ * out of the same heat. A part recorded before pouring weights were tracked
+ * falls back to its finished weight - understating it slightly, which is the
+ * safe direction for a limit.
+ */
+function castingMetal(part: { weightPerPiece: number; pouringWeight: number | null }): number {
+  return part.pouringWeight || part.weightPerPiece;
+}
+
+/*
+ * There is no allowance band and no block.
+ *
+ * Castings that need more metal than went into the furnace are worth stopping
+ * to explain - the weights may be wrong, or metal may have come from somewhere
+ * nobody wrote down - but the person at the furnace knows what happened and
+ * the system does not. So it asks for a note and saves what they tell it.
+ */
 
 interface Part {
   id: string;
@@ -189,6 +224,7 @@ interface ProductionRecord {
       name: string;
       partCode: string;
       weightPerPiece: number;
+      pouringWeight: number | null;
     };
   }>;
   furnace?: { id: string; name: string } | null;
@@ -203,6 +239,12 @@ interface ProductionRecord {
   aluminumUsedLM6: number;
   aluminumUsedLM9: number;
   aluminumUsedLM25: number;
+  /** Metal still in the furnace when this batch closed. Null if not recorded. */
+  metalRemaining?: number | null;
+  /** Metal melted in from the previous heat - charge, but never stock. */
+  carriedInWeight?: number;
+  carriedFrom?: { id: string; batchNumber: string } | null;
+  carriedTo?: { id: string; batchNumber: string } | null;
   // Defaulted to 0 server-side, so batches saved before scrap re-melt was
   // tracked still satisfy this.
   runnerRaiserScrapUsed: number;
@@ -231,7 +273,7 @@ export default function ProductionPage() {
    * forward (null when a new one is being charged).
    */
   const [batchModal, setBatchModal] = React.useState<
-    "create" | "melt" | "complete" | "amend" | null
+    "create" | "melt" | "parts" | "complete" | "amend" | null
   >(null);
   const [editingRecord, setEditingRecord] =
     React.useState<ProductionRecord | null>(null);
@@ -266,6 +308,7 @@ export default function ProductionPage() {
   // Form state
   const [formData, setFormData] = React.useState({
     furnaceId: "",
+    operatorId: "",
     // A heat is charged with one alloy, so the grade is picked once and the
     // weight is entered against it. The API still takes a per-grade split;
     // the other two grades go over as zero.
@@ -279,6 +322,7 @@ export default function ProductionPage() {
     runnerRaiserScrap: "",
     spillageScrap: "",
     rejectedPartScrap: "",
+    metalRemaining: "",
     notes: "",
   });
 
@@ -288,6 +332,23 @@ export default function ProductionPage() {
 
   // Fixed LM6 element readings, keyed by chemical symbol
   const [elementValues, setElementValues] = React.useState<Record<string, string>>({});
+  /**
+   * Grams of each element added to the melt.
+   *
+   * Kept apart from the readings because they answer different questions:
+   * what the heat contains, and what was put in to get it there. A heat can
+   * have one without the other - an addition made before the re-assay, or a
+   * reading on a heat nobody corrected.
+   */
+  const [elementGrams, setElementGrams] = React.useState<Record<string, string>>({});
+  /**
+   * Which elements are showing their "added" box.
+   *
+   * Most heats are assayed without anything being thrown in, so the box is
+   * opened per element rather than standing empty on every row. A batch that
+   * already has additions recorded opens them itself - see openStage.
+   */
+  const [gramsOpen, setGramsOpen] = React.useState<Set<string>>(new Set());
   // Aluminium is auto-filled with the balance until the operator types their
   // own figure - an assay that only covers a few elements makes the computed
   // balance a guess, so they must be able to overrule it.
@@ -299,6 +360,30 @@ export default function ProductionPage() {
   const [furnaces, setFurnaces] = React.useState<
     Array<{ id: string; name: string; openBatches: number }>
   >([]);
+  /**
+   * Metal still sitting in a furnace from a previous heat, unclaimed.
+   *
+   * Reloaded whenever the create form opens: a heel can be taken by another
+   * operator between one batch and the next, and offering metal that is
+   * already gone would only produce a refusal on save.
+   */
+  /** Shop-floor employees, for naming who ran a heat. */
+  const [employees, setEmployees] = React.useState<
+    Array<{ id: string; name: string; employeeCode: string }>
+  >([]);
+  const [heels, setHeels] = React.useState<
+    Array<{
+      id: string;
+      batchNumber: string;
+      metalRemaining: number;
+      ingotGrade: AluminumType;
+      /** Whether the batch it came from has been closed yet. */
+      status?: ProductionStatus;
+      furnaceId: string | null;
+      furnace: { id: string; name: string } | null;
+    }>
+  >([]);
+  const [carriedFromId, setCarriedFromId] = React.useState<string | null>(null);
   // True when the stock lookup failed, so "0 kg" is not shown as if it were
   // a real reading
   const [stockLoadFailed, setStockLoadFailed] = React.useState(false);
@@ -315,19 +400,43 @@ export default function ProductionPage() {
 
   /** Parts, furnaces and stock feed the form, so they load unpaginated. */
   const fetchLookups = React.useCallback(async () => {
-    const [partsRes, furnacesRes, stockRes] = await Promise.all([
+    const [partsRes, furnacesRes, stockRes, heelsRes, employeesRes] =
+      await Promise.all([
       fetch("/api/parts"),
       fetch("/api/furnaces"),
       // Stock comes from the production-scoped endpoint, not /api/inventory:
       // a production manager charges furnaces without holding inventory
       // access, and reading 0 kg for every grade would block them entirely.
       fetch("/api/production/stock"),
+      // What previous heats left behind and nobody has claimed yet
+      fetch("/api/production/heels"),
+      // Who can be named as having run a heat
+      fetch("/api/employees"),
     ]);
     const partsData = await partsRes.json();
     const furnacesData = await furnacesRes.json();
     const stockData = await stockRes.json();
+    const heelsData = await heelsRes.json();
     if (partsData.success) setParts(partsData.data);
     if (furnacesData.success) setFurnaces(furnacesData.data || []);
+    if (heelsData.success) setHeels(heelsData.data || []);
+
+    const employeesData = await employeesRes.json();
+    if (employeesData.success) {
+      const list = Array.isArray(employeesData.data)
+        ? employeesData.data
+        : employeesData.data?.employees ?? [];
+      setEmployees(
+        (
+          list as Array<{
+            id: string;
+            name: string;
+            employeeCode: string;
+            isActive: boolean;
+          }>
+        ).filter((e) => e.isActive)
+      );
+    }
     if (Array.isArray(stockData.data)) {
       // Stock per grade and form, so the form can show what may be charged
       setStockByType(
@@ -421,9 +530,37 @@ export default function ProductionPage() {
   // section shows and the admin can correct whichever part is wrong
   const showCharge = batchModal === "create" || batchModal === "amend";
   const showMelt = batchModal === "melt" || batchModal === "amend";
-  const showOutput = batchModal === "complete" || batchModal === "amend";
+  /*
+   * A heat is written up in two sittings, so its output is two sections.
+   *
+   * The castings are counted as they come off the line; the scrap is weighed
+   * later, once it has been collected and the runners cut. Asking for both at
+   * once meant one of them was always a guess. Amending shows the lot.
+   */
+  const showParts = batchModal === "parts" || batchModal === "amend";
+  const showScrap = batchModal === "complete" || batchModal === "amend";
+  /** Anything output-related is on screen - used for figures both halves share. */
+  const showOutput = showParts || showScrap;
   const isAmending = batchModal === "amend";
   const furnaceOptions = furnaces.map((f) => ({ value: f.id, label: f.name }));
+
+  /**
+   * The same list, with any metal still standing in each furnace named on it.
+   *
+   * The panel offering a heel only appears once a furnace is chosen, so until
+   * then nothing said which furnace had 856 kg waiting in it - the metal was
+   * there, and invisible, at exactly the moment somebody is deciding how much
+   * ingot to charge.
+   */
+  const furnaceChargeOptions = furnaces.map((f) => {
+    const waiting = heels.filter((h) => h.furnaceId === f.id);
+    if (waiting.length === 0) return { value: f.id, label: f.name };
+    const total = waiting.reduce((sum, h) => sum + h.metalRemaining, 0);
+    return {
+      value: f.id,
+      label: `${f.name} - ${formatWeight(total)} of ${gradeName(waiting[0].ingotGrade)} still in it`,
+    };
+  });
   // A furnace at its limit cannot take another batch until some are closed
   const selectedFurnace = furnaces.find((f) => f.id === formData.furnaceId);
   const furnaceIsFull =
@@ -484,11 +621,38 @@ export default function ProductionPage() {
     parseWeightInput(formData.runnerRaiserScrapUsed) +
     parseWeightInput(formData.spillageScrapUsed) +
     parseWeightInput(formData.rejectedPartScrapUsed);
-  const totalCharge = ingotChargeTotal + scrapUsedTotal;
+
+  /*
+   * Metal left in the chosen furnace by its last heat.
+   *
+   * Only the heels that can actually go into THIS heat are offered: same
+   * furnace, because molten metal does not move on its own, and same alloy,
+   * because an LM6 heel in an LM9 heat contaminates it. Anything else would be
+   * a choice the server is going to refuse.
+   */
+  const usableHeels = heels.filter(
+    (h) =>
+      h.furnaceId === formData.furnaceId && h.ingotGrade === formData.ingotGrade
+  );
+  // Carrying the leftover is compulsory - molten metal already in the furnace
+  // cannot be left behind. So when a usable heel exists the charge always
+  // includes one: the operator's explicit pick, or the first usable heel by
+  // default (they can only change WHICH when more than one is waiting). It is
+  // only ever null when there is genuinely no leftover.
+  const chosenHeel =
+    usableHeels.find((h) => h.id === carriedFromId) ?? usableHeels[0] ?? null;
+  const carriedWeight = chosenHeel?.metalRemaining ?? 0;
+
+  // The charge is everything in the furnace. Only the first two came out of
+  // stock - the heel was deducted when the batch that left it was charged.
+  const totalCharge = ingotChargeTotal + scrapUsedTotal + carriedWeight;
 
   const resetForm = () => {
+    setCarriedFromId(null);
+    setManualScrap(new Set());
     setFormData({
       furnaceId: "",
+      operatorId: "",
       ingotGrade: "INGOT_LM6" as AluminumType,
       aluminumUsed: "",
       runnerRaiserScrapUsed: "",
@@ -499,11 +663,14 @@ export default function ProductionPage() {
       runnerRaiserScrap: "",
       spillageScrap: "",
       rejectedPartScrap: "",
+      metalRemaining: "",
       notes: "",
     });
     setPartLines([]);
     setPartToAdd("");
     setElementValues({});
+    setElementGrams({});
+    setGramsOpen(new Set());
     setAlIsAuto(true);
     setError("");
   };
@@ -652,24 +819,132 @@ export default function ProductionPage() {
    * still had its gating cut off.
    */
   const expectedFromParts = React.useMemo(() => {
-    let scrap = 0;
-    let poured = 0;
-    let counted = 0;
+    const lines = partLines
+      .map((line) => {
+        const qty = parseInt(line.quantityProduced) || 0;
+        const part = parts.find((p) => p.id === line.partId);
+        if (qty <= 0 || !part) return null;
+        return {
+          quantityProduced: qty,
+          goodParts: parseInt(line.goodParts) || 0,
+          part: {
+            weightPerPiece: part.weightPerPiece,
+            pouringWeight: part.pouringWeight,
+          },
+        };
+      })
+      .filter((l): l is NonNullable<typeof l> => l !== null);
+
+    // Same function the server uses to work these out, so the figures on
+    // screen and the figures saved cannot drift apart
+    const out = castingOutput(lines);
+    return { ...out, known: lines.length > 0 && out.complete };
+  }, [partLines, parts]);
+
+  /**
+   * The charge this batch had to work with, and what should be left of it.
+   *
+   * Charge is fixed once the furnace is charged, so it comes off the record
+   * being completed; what is left is that less everything poured into moulds.
+   */
+  /*
+   * The metal this batch had to pour from.
+   *
+   * Fixed when completing - the charge was recorded hours ago and is not on
+   * screen. When amending it IS on screen and being edited, so the figures
+   * have to follow what is being typed; reading the stored charge there meant
+   * raising it to fix an over-poured batch changed nothing.
+   */
+  const completionCharge = isAmending
+    ? totalCharge + (editingRecord?.carriedInWeight ?? 0)
+    : editingRecord
+    ? chargeOf(editingRecord)
+    : totalCharge;
+  const suggestedRemaining = suggestedHeel(
+    completionCharge,
+    expectedFromParts.poured
+  );
+
+  /**
+   * What the castings entered would take out of the furnace, against what went
+   * in.
+   *
+   * A heat charged with 100 kg making 15 castings that need 10 kg each is
+   * usually a miscount - the metal was not there. Usually, not always: metal
+   * gets added from another furnace and a part weight can be wrong on the
+   * drawing. So this asks for a note rather than refusing the figures.
+   */
+  const capacity = React.useMemo(() => {
+    let needed = 0;
+    // The largest castings first - they are what a count has to come off
     for (const line of partLines) {
       const qty = parseInt(line.quantityProduced) || 0;
       if (qty <= 0) continue;
       const part = parts.find((p) => p.id === line.partId);
       if (!part) continue;
-      // A part added before pouring weights were recorded has none; it would
-      // otherwise drag the total down and look like a shortfall.
-      const perCasting = expectedScrapOf(part);
-      if (perCasting === null || !part.pouringWeight) continue;
-      scrap += qty * perCasting;
-      poured += qty * part.pouringWeight;
-      counted += 1;
+      needed += qty * castingMetal(part);
     }
-    return { scrap, poured, known: counted > 0 };
-  }, [partLines, parts]);
+
+    // One part is the common case, and the only one where "that many fit" is
+    // unambiguous advice
+    const only = partLines.length === 1
+      ? parts.find((p) => p.id === partLines[0].partId)
+      : undefined;
+    const maxCastings = only
+      ? Math.floor(completionCharge / Math.max(1, castingMetal(only)))
+      : null;
+
+    return {
+      needed,
+      over: completionCharge > 0 && needed > completionCharge,
+      maxCastings,
+    };
+  }, [partLines, parts, completionCharge]);
+
+  /*
+   * Scrap fields fill themselves in from the parts.
+   *
+   * Every casting's gating comes off it and every rejected casting is scrap,
+   * and the parts carry the weights, so making the operator work that out on
+   * paper was asking for arithmetic they should not have to do. Typing in a
+   * field marks it theirs and this stops touching it - the bench scale wins
+   * over the calculation, the same way it does on the fettling sheet.
+   *
+   * Only on a fresh completion: amending a saved batch prefills the figures
+   * that were actually recorded, which must not be overwritten.
+   */
+  const [manualScrap, setManualScrap] = React.useState<Set<string>>(new Set());
+  React.useEffect(() => {
+    // Amending fills it in as well: an older batch has no figure to preserve,
+    // and the effect leaves anything already entered alone
+    if (batchModal !== "complete" && batchModal !== "amend") return;
+    if (expectedFromParts.poured <= 0) return;
+    setFormData((prev) => ({
+      ...prev,
+      /*
+       * The scrap figures need the parts' pouring weights - without them the
+       * gating is unknown and a guess would be worse than a blank.
+       *
+       * What is left in the furnace does not: it is what went in less what was
+       * poured, and the castings' own weight is a floor for that even when the
+       * gating was never measured. So it fills itself in either way.
+       */
+      ...(expectedFromParts.known
+        ? {
+            runnerRaiserScrap: manualScrap.has("runnerRaiserScrap")
+              ? prev.runnerRaiserScrap
+              : weightToInput(expectedFromParts.runnerRaiser),
+            rejectedPartScrap: manualScrap.has("rejectedPartScrap")
+              ? prev.rejectedPartScrap
+              : weightToInput(expectedFromParts.rejectedPart),
+          }
+        : {}),
+      metalRemaining: manualScrap.has("metalRemaining")
+        ? prev.metalRemaining
+        : weightToInput(suggestedRemaining),
+    }));
+  }, [batchModal, expectedFromParts, suggestedRemaining, manualScrap]);
+
 
 
   /**
@@ -689,11 +964,12 @@ export default function ProductionPage() {
       );
       return;
     }
-    // Either will do: a heat can run on fresh ingot, on re-melted scrap, or
-    // on both. What it cannot be is empty.
+    // Any of the three will do: a heat can run on fresh ingot, on re-melted
+    // scrap, or on nothing but what the last heat left behind. What it cannot
+    // be is empty.
     if (totalCharge <= 0) {
       setError(
-        `Enter the ${selectedGrade.grade} ingot or scrap charged into this heat`
+        `Enter the ${selectedGrade.grade} ingot or scrap charged into this heat, or carry over the metal left in the furnace`
       );
       return;
     }
@@ -723,6 +999,13 @@ export default function ProductionPage() {
 
     await submitBatch("/api/production", "POST", {
       furnaceId: formData.furnaceId,
+      // Blank is allowed - the batch matters more than the label on it
+      operatorId: formData.operatorId || null,
+      // The server re-reads the weight from that batch rather than trusting a
+      // number from here - it is metal, and only one heat may have it.
+      // Resolved (not the raw state) so the compulsory default heel is carried
+      // even when the operator never explicitly picked one.
+      carriedFromId: chosenHeel?.id ?? null,
       // Sent explicitly: with no ingot at all there is nothing for the server
       // to infer the alloy from
       ingotGrade: formData.ingotGrade,
@@ -758,13 +1041,27 @@ export default function ProductionPage() {
       stage: "melt",
       densityAtmospheric: formData.densityAtmospheric || undefined,
       densityVacuum: formData.densityVacuum || undefined,
-      composition: buildCompositionEntries(elementValues),
+      composition: buildCompositionEntries(elementValues, elementGrams),
     });
   };
 
-  /** Stage 3 - count the castings, book the scrap, close the batch. */
-  const handleCompleteBatch = async () => {
+  /** Stage 3 - count the castings and what is left in the furnace. */
+  const handleRecordParts = async () => {
     if (!editingRecord) return;
+
+    /*
+     * The only thing standing in the way: an unexplained overshoot.
+     *
+     * The figures are saved either way - the person at the furnace knows what
+     * happened - but a batch whose parts need more metal than went in is
+     * unreadable a month later without a line saying why.
+     */
+    if (capacity.over && formData.notes.trim().length < 10) {
+      setError(
+        "Write a proper reason (a sentence or so) for making more parts than the metal can make"
+      );
+      return;
+    }
 
     if (partLines.length === 0) {
       setError("Add at least one part to this batch");
@@ -785,15 +1082,32 @@ export default function ProductionPage() {
     }
 
     await submitBatch(`/api/production/${editingRecord.id}`, "PATCH", {
-      stage: "complete",
+      // The castings and what they left behind. No scrap figures: the runners
+      // have not been cut and weighed yet, and sending 0 would book that.
+      stage: "parts",
       items: partLines.map((line) => ({
         partId: line.partId,
         quantityProduced: parseInt(line.quantityProduced) || 0,
         goodParts: parseInt(line.goodParts) || 0,
       })),
+      metalRemaining: parseWeightInput(formData.metalRemaining),
+      notes: formData.notes,
+    });
+  };
+
+  /** Stage 4 - weigh the scrap and close the batch. */
+  const handleCompleteBatch = async () => {
+    if (!editingRecord) return;
+
+    await submitBatch(`/api/production/${editingRecord.id}`, "PATCH", {
+      // The castings were counted at the previous stage and are not on screen,
+      // so they are left out and the batch keeps what it already holds
+      stage: "complete",
       runnerRaiserScrap: parseWeightInput(formData.runnerRaiserScrap),
       spillageScrap: parseWeightInput(formData.spillageScrap),
       rejectedPartScrap: parseWeightInput(formData.rejectedPartScrap),
+      // Shown on this stage too, so it is sent from here as well
+      metalRemaining: parseWeightInput(formData.metalRemaining),
       notes: formData.notes,
     });
   };
@@ -839,6 +1153,9 @@ export default function ProductionPage() {
         }
 
         await fetchLookups();
+        // Completing or amending a batch puts castings on the shop floor, so
+        // an open Shop Floor or Fettling tab needs to know
+        announcePiecesChanged();
       } else {
         setError(data.error || "Failed to save batch");
       }
@@ -872,13 +1189,17 @@ export default function ProductionPage() {
    */
   const openStage = (
     record: ProductionRecord,
-    stage: "melt" | "complete" | "amend"
+    stage: "melt" | "parts" | "complete" | "amend"
   ) => {
     setEditingRecord(record);
     setError("");
 
     const wantsMelt = stage === "melt" || stage === "amend";
-    const wantsOutput = stage === "complete" || stage === "amend";
+    // The castings and the furnace figure belong to the parts stage; the scrap
+    // to the closing one. Amending opens all of it.
+    const wantsParts = stage === "parts" || stage === "amend";
+    const wantsScrap = stage === "complete" || stage === "amend";
+    const wantsOutput = wantsParts || wantsScrap;
     const wantsCharge = stage === "amend";
 
     if (wantsMelt) {
@@ -886,11 +1207,15 @@ export default function ProductionPage() {
       // they come back through the boundary that strips it
       const values = compositionToInputs(record.composition);
       setElementValues(values);
+      setElementGrams(compositionGramsToInputs(record.composition));
+      setGramsOpen(new Set(Object.keys(compositionGramsToInputs(record.composition))));
       // Al was typed by hand if it is on the record, so do not overwrite it
       // with the computed balance
       setAlIsAuto(!values.Al);
     } else {
       setElementValues({});
+      setElementGrams({});
+      setGramsOpen(new Set());
       setAlIsAuto(true);
     }
 
@@ -933,10 +1258,46 @@ export default function ProductionPage() {
             runnerRaiserScrap: kg(record.runnerRaiserScrap),
             spillageScrap: kg(record.spillageScrap),
             rejectedPartScrap: kg(record.rejectedPartScrap),
+            /*
+             * The metal left in the furnace, as recorded.
+             *
+             * This was missing, so amending a batch opened the field blank and
+             * saved 0 over whatever was there - quietly emptying a furnace
+             * that still had metal in it, and losing a heel the next heat was
+             * waiting to carry.
+             */
+            metalRemaining: kg(record.metalRemaining ?? 0),
             notes: record.notes ?? "",
           }
         : {}),
     }));
+
+    /*
+     * A figure already on the record stands as entered - reopening a batch
+     * must not silently restate what somebody wrote. One that was never
+     * recorded (a batch closed before this was tracked) is left for the
+     * calculation below to fill in.
+     */
+    const recorded = new Set<string>();
+    if (wantsOutput) {
+      // A figure already on the record stands as entered - reopening a batch
+      // must not silently restate what somebody wrote down
+      if (record.runnerRaiserScrap > 0) recorded.add("runnerRaiserScrap");
+      if (record.rejectedPartScrap > 0) recorded.add("rejectedPartScrap");
+      /*
+       * What is left in the furnace is NOT seeded, on purpose.
+       *
+       * The scrap figures above were weighed - nobody can recompute them, so
+       * they stand as recorded. This one is arithmetic: everything charged
+       * less everything poured. An admin opening Update is usually correcting
+       * a count or the charge, and the metal left has to follow the figures it
+       * comes from rather than keeping a total that no longer matches them.
+       * Typing in the field still stops it, and the hint below shows what was
+       * recorded before, so a deliberate figure is never lost silently.
+       */
+    }
+    // Whatever was never recorded is left for the calculation to fill in
+    setManualScrap(recorded);
 
     setBatchModal(stage);
   };
@@ -992,7 +1353,7 @@ export default function ProductionPage() {
       rejectedPartScrapUsed: parseWeightInput(formData.rejectedPartScrapUsed),
       densityAtmospheric: formData.densityAtmospheric || undefined,
       densityVacuum: formData.densityVacuum || undefined,
-      composition: buildCompositionEntries(elementValues),
+      composition: buildCompositionEntries(elementValues, elementGrams),
       items: partLines.map((line) => ({
         partId: line.partId,
         quantityProduced: parseInt(line.quantityProduced) || 0,
@@ -1001,6 +1362,7 @@ export default function ProductionPage() {
       runnerRaiserScrap: parseWeightInput(formData.runnerRaiserScrap),
       spillageScrap: parseWeightInput(formData.spillageScrap),
       rejectedPartScrap: parseWeightInput(formData.rejectedPartScrap),
+      metalRemaining: parseWeightInput(formData.metalRemaining),
       notes: formData.notes,
     });
   };
@@ -1336,25 +1698,55 @@ export default function ProductionPage() {
                             )
                           : (
                             <>
+                              {/* The three stages, in the order the heat runs:
+                                  the melt is read, the castings are counted,
+                                  the scrap is weighed. Each opens only once
+                                  the one before it has been done, so the row
+                                  shows how far the batch has got. */}
                               <Button
                                 variant="ghost"
                                 size="icon"
                                 title={
                                   record.status === "PENDING"
-                                    ? "Add the melt reading"
-                                    : "Edit the melt reading"
+                                    ? "1. Add the melt reading"
+                                    : "1. Edit the melt reading"
                                 }
                                 onClick={() => openStage(record, "melt")}
                               >
                                 <FlaskRound className="h-4 w-4" />
                               </Button>
                               <Button
-                                variant="outline"
-                                size="sm"
-                                title="Count the castings and close this batch"
-                                onClick={() => openStage(record, "complete")}
+                                variant="ghost"
+                                size="icon"
+                                disabled={record.status === "PENDING"}
+                                title={
+                                  record.status === "PENDING"
+                                    ? "Add the melt reading first"
+                                    : record.items.length > 0
+                                    ? "2. Edit the castings counted"
+                                    : "2. Count the castings poured"
+                                }
+                                onClick={() => openStage(record, "parts")}
                               >
-                                Complete
+                                <Package className="h-4 w-4" />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                disabled={record.items.length === 0}
+                                title={
+                                  record.items.length === 0
+                                    ? "Count the castings first"
+                                    : "3. Weigh the scrap and close this batch"
+                                }
+                                onClick={() => openStage(record, "complete")}
+                                className={
+                                  record.items.length > 0
+                                    ? "text-green-700 hover:text-green-800"
+                                    : undefined
+                                }
+                              >
+                                <CheckCircle2 className="h-4 w-4" />
                               </Button>
                             </>
                           )}
@@ -1394,8 +1786,44 @@ export default function ProductionPage() {
         size="xl"
       >
         <div className="space-y-6">
+          {/* More castings entered than the charge could have poured.
+              At the top, because it is the reason the button below is dead -
+              a disabled control with its explanation out of sight sends people
+              hunting for what is wrong. */}
+          {showParts && capacity.over && (
+            <div className="rounded-lg border border-amber-300 bg-amber-50 p-4">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" />
+                <div className="text-sm text-amber-900">
+                  <p className="font-medium">
+                    More parts than the metal can make
+                  </p>
+                  <p className="mt-1">
+                    {batchTotals.quantityProduced} part
+                    {batchTotals.quantityProduced === 1 ? "" : "s"} need{" "}
+                    <span className="font-semibold">
+                      {formatWeight(capacity.needed)}
+                    </span>{" "}
+                    of metal. Only{" "}
+                    <span className="font-semibold">
+                      {formatWeight(completionCharge)}
+                    </span>{" "}
+                    went into this furnace.
+                    {capacity.maxCastings !== null && (
+                      <> That is enough for about {capacity.maxCastings} parts.</>
+                    )}
+                  </p>
+                  <p className="mt-1.5">
+                    Check the count first. If the count is right, type the
+                    reason below &mdash; then save.
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Parts in this batch - only at completion, when they are counted */}
-          {showOutput && (
+          {showParts && (
           <div className="rounded-lg border border-[var(--primary)]/20 bg-[var(--accent)] p-4">
             <h4 className="mb-3 font-medium text-[var(--foreground)]">
               Parts in this Batch
@@ -1484,6 +1912,37 @@ export default function ProductionPage() {
                           disabled
                         />
                       </div>
+
+                      {/* One plain sentence: what this many parts eat, and
+                          what that leaves in the furnace.
+                          It used to read "10 parts use 100.00 kg of metal ·
+                          25.00 kg comes back as scrap · 5 bad = 50.00 kg" -
+                          three facts at once, and the two scrap figures are
+                          already written in their own boxes further down. */}
+                      {qty > 0 && part && (
+                        <p className="mt-2 text-xs font-medium text-amber-600">
+                          {qty} part{qty === 1 ? "" : "s"} use{" "}
+                          {formatWeight(qty * castingMetal(part))} of metal.
+                          {/* Only with a single part is "what is left" this
+                              line's business - with two, the furnace holds
+                              what BOTH of them left, and the panel below says
+                              so for the batch as a whole */}
+                          {partLines.length === 1 && completionCharge > 0 && (
+                            <>
+                              {" "}
+                              {suggestedRemaining > 0
+                                ? `${formatWeight(suggestedRemaining)} left in the bhatti.`
+                                : "Nothing left in the bhatti."}
+                            </>
+                          )}
+                          {!part.pouringWeight && (
+                            <span className="text-[var(--muted-foreground)]">
+                              {" "}
+                              (pouring weight not set for this part)
+                            </span>
+                          )}
+                        </p>
+                      )}
                     </div>
                   );
                 })}
@@ -1524,9 +1983,30 @@ export default function ProductionPage() {
             <h4 className="font-medium text-[var(--foreground)] mb-3">
               Furnace &amp; Input Material
             </h4>
+            {/* Who was actually on the furnace. Optional: the login name
+                records who typed the batch in, usually a manager writing up
+                someone else's shift, and losing a whole heat over a missing
+                label would be the worse trade. */}
+            {batchModal === "create" && (
+              <Select
+                label="Operator - who ran this batch (optional)"
+                options={[
+                  { value: "", label: "Not recorded" },
+                  ...employees.map((e) => ({
+                    value: e.id,
+                    label: `${e.name} (${e.employeeCode})`,
+                  })),
+                ]}
+                value={formData.operatorId}
+                onChange={(value) =>
+                  setFormData({ ...formData, operatorId: value })
+                }
+                className="mb-4 h-12"
+              />
+            )}
             <Select
               label="Furnace (Bhatti)"
-              options={furnaceOptions}
+              options={furnaceChargeOptions}
               value={formData.furnaceId}
               onChange={(value) => setFormData({ ...formData, furnaceId: value })}
               placeholder={
@@ -1709,6 +2189,85 @@ export default function ProductionPage() {
               })}
             </div>
 
+            {/* Metal the last heat on this furnace did not pour.
+                Offered only when creating - amending a batch cannot change
+                which heel it was built on without rewriting the batch that
+                left it. */}
+            {batchModal === "create" && usableHeels.length > 0 && (
+              <div className="mt-4 rounded-lg border border-amber-300 bg-amber-50 p-3">
+                <p className="text-sm font-medium text-amber-900">
+                  Metal still in {selectedFurnace?.name ?? "this furnace"} &mdash; carried
+                  into this heat
+                </p>
+                {/* Carrying the leftover is mandatory, so there is nothing to
+                    tick - a control implies a choice that does not exist, and
+                    an unticked box implies the metal stays behind.
+                    More than one leftover on the same furnace and alloy is the
+                    only case with a real decision, and that is offered as a
+                    plain link rather than a form control. */}
+                <div className="mt-2 space-y-2">
+                  {usableHeels.map((heel) => {
+                    const picked = chosenHeel?.id === heel.id;
+                    const line = (
+                      <span>
+                        Batch {heel.batchNumber} left{" "}
+                        <span className="font-semibold">
+                          {formatWeight(heel.metalRemaining)}
+                        </span>{" "}
+                        of {gradeName(heel.ingotGrade)}.{" "}
+                        {picked
+                          ? "It is melted into this heat."
+                          : "It stays in the furnace for a later heat."}
+                        {heel.status && heel.status !== "COMPLETED" && (
+                          <span className="block text-xs text-amber-800">
+                            That batch is still open - its scrap has not been weighed yet,
+                            but the metal is in the furnace now.
+                          </span>
+                        )}
+                      </span>
+                    );
+                    return (
+                      <div
+                        key={heel.id}
+                        className={`flex items-start gap-2 text-sm ${
+                          picked ? "text-amber-900" : "text-[var(--muted-foreground)]"
+                        }`}
+                      >
+                        <ArrowRight
+                          className={`mt-0.5 h-4 w-4 shrink-0 ${
+                            picked ? "text-amber-700" : "opacity-40"
+                          }`}
+                        />
+                        <span>
+                          {line}
+                          {!picked && (
+                            <button
+                              type="button"
+                              onClick={() => setCarriedFromId(heel.id)}
+                              className="ml-1 cursor-pointer font-medium text-[var(--primary)] hover:underline"
+                            >
+                              Use this one instead
+                            </button>
+                          )}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+                <p className="mt-2 text-xs font-medium text-amber-800">
+                  This leftover metal is in the furnace now, so it is always melted into the
+                  next heat &mdash; it cannot be left behind.
+                </p>
+                {chosenHeel && (
+                  <p className="mt-1 text-xs text-amber-800">
+                    It is already out of stock - it left inventory when batch{" "}
+                    {chosenHeel.batchNumber} was charged - so nothing is deducted for it
+                    again.
+                  </p>
+                )}
+              </div>
+            )}
+
             {totalCharge > 0 && (
               <p className="mt-3 text-sm text-[var(--muted-foreground)]">
                 Total charge:{" "}
@@ -1717,6 +2276,16 @@ export default function ProductionPage() {
                 </span>
                 {scrapUsedTotal > 0 && (
                   <> &middot; {formatWeight(scrapUsedTotal)} of it re-melted scrap</>
+                )}
+                {carriedWeight > 0 && (
+                  <>
+                    {" "}
+                    &middot;{" "}
+                    <span className="text-amber-700">
+                      {formatWeight(carriedWeight)} carried over from{" "}
+                      {chosenHeel?.batchNumber}
+                    </span>
+                  </>
                 )}
               </p>
             )}
@@ -1738,102 +2307,172 @@ export default function ProductionPage() {
               the LM6 limit are flagged but still saved.
             </p>
 
-            <div className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2 lg:grid-cols-3">
-              {LM6_ELEMENTS.map((element) => {
-                const raw = elementValues[element.symbol] ?? "";
+            {/* A row per element, with the spec beside it.
+                Two facts are recorded, and they are not the same thing: what
+                the spectro read, and what was thrown in to get it there. A
+                grid of single boxes had nowhere to put the second, and a
+                dozen elements down a page is a table, so it is one - with the
+                header pinned and the list scrolling inside it. */}
+            <div className="max-h-[22rem] overflow-auto rounded-lg border border-[var(--border)]">
+              <table className="w-full">
+                <thead className="sticky top-0 z-10 bg-[var(--card)]">
+                  <tr className="border-b border-[var(--border)]">
+                    <th className="px-4 py-2.5 text-left text-sm font-semibold">
+                      Element
+                    </th>
+                    <th className="px-4 py-2.5 text-left text-sm font-semibold">
+                      LM6 limit
+                    </th>
+                    <th className="px-4 py-2.5 text-left text-sm font-semibold">
+                      Actual %
+                    </th>
+                    <th className="px-4 py-2.5 text-left text-sm font-semibold">
+                      Added (g)
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {LM6_ELEMENTS.map((element) => {
+                    const raw = elementValues[element.symbol] ?? "";
+                    const grams = elementGrams[element.symbol] ?? "";
+                    const { error, warning } = element.isRemainder
+                      ? { error: null, warning: null }
+                      : checkElementValue(element, raw);
+                    const balance = element.isRemainder
+                      ? aluminiumBalance(elementValues)
+                      : null;
 
-                if (element.isRemainder) {
-                  const { entered, total, overflow } =
-                    aluminiumBalance(elementValues);
-
-                  return (
-                    <div key={element.symbol}>
-                      <div className="mb-1.5 flex items-center justify-between gap-2">
-                        <label
-                          htmlFor="element-Al"
-                          className="text-sm font-medium text-[var(--foreground)]"
-                        >
-                          {element.name} ({element.symbol})
-                        </label>
-                        {alIsAuto ? (
-                          <span className="rounded-full bg-[var(--accent)] px-2 py-0.5 text-xs font-medium text-[var(--primary)]">
-                            Auto
+                    return (
+                      <tr
+                        key={element.symbol}
+                        className="border-b border-[var(--border)] last:border-0"
+                      >
+                        <td className="px-4 py-2.5">
+                          <span className="block text-sm font-medium text-[var(--foreground)]">
+                            {element.name}
                           </span>
-                        ) : (
-                          <button
-                            type="button"
-                            onClick={restoreAutoAluminium}
-                            className="cursor-pointer text-xs font-medium text-[var(--primary)] hover:underline"
-                          >
-                            Use balance
-                          </button>
-                        )}
-                      </div>
-                      <Input
-                        id="element-Al"
-                        type="number"
-                        step="0.001"
-                        min="0"
-                        max="100"
-                        inputMode="decimal"
-                        placeholder={overflow ? "Check readings" : "%"}
-                        value={raw}
-                        error={
-                          overflow
-                            ? `Other elements already total ${total}%`
-                            : checkElementValue(element, raw).error ?? undefined
-                        }
-                        helperText={
-                          overflow
-                            ? undefined
-                            : alIsAuto
-                              ? entered === 0
-                                ? "Balance of the heat, filled in for you"
-                                : `Balance of ${total}% entered so far`
-                              : "Entered manually"
-                        }
-                        onChange={(e) => {
-                          setAlIsAuto(false);
-                          setElementValue("Al", e.target.value);
-                        }}
-                      />
-                    </div>
-                  );
-                }
-
-                const { error, warning } = checkElementValue(element, raw);
-
-                return (
-                  <div key={element.symbol}>
-                    <Input
-                      label={`${element.name} (${element.symbol})`}
-                      type="number"
-                      step="0.001"
-                      min="0"
-                      max="100"
-                      inputMode="decimal"
-                      placeholder="%"
-                      value={raw}
-                      error={error ?? undefined}
-                      // The warning names the limit it broke, so it replaces
-                      // the spec line rather than stacking under it - that
-                      // keeps every cell one line tall and the grid aligned.
-                      helperText={warning ? undefined : element.limit}
-                      className={
-                        !error && warning
-                          ? "border-amber-500 focus:ring-amber-500"
-                          : undefined
-                      }
-                      onChange={(e) =>
-                        setElementValue(element.symbol, e.target.value)
-                      }
-                    />
-                    {!error && warning && (
-                      <p className="mt-1.5 text-sm text-amber-600">{warning}</p>
-                    )}
-                  </div>
-                );
-              })}
+                          <span className="block text-xs text-[var(--muted-foreground)]">
+                            {element.symbol}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2.5 text-sm text-[var(--muted-foreground)]">
+                          {element.limit}
+                        </td>
+                        <td className="px-4 py-2.5">
+                          <Input
+                            type="number"
+                            step="0.001"
+                            min="0"
+                            max="100"
+                            inputMode="decimal"
+                            placeholder={
+                              balance?.overflow ? "Check readings" : "%"
+                            }
+                            value={raw}
+                            error={
+                              balance?.overflow
+                                ? `Others total ${balance.total}%`
+                                : error ?? undefined
+                            }
+                            className={
+                              !error && warning
+                                ? "border-amber-500 focus:ring-amber-500"
+                                : undefined
+                            }
+                            onChange={(e) => {
+                              // Aluminium stops following the balance the
+                              // moment somebody types their own reading
+                              if (element.isRemainder) setAlIsAuto(false);
+                              setElementValue(element.symbol, e.target.value);
+                            }}
+                          />
+                          {!error && warning && (
+                            <p className="mt-1 text-xs text-amber-600">{warning}</p>
+                          )}
+                          {element.isRemainder && !balance?.overflow && (
+                            <p className="mt-1 flex items-center gap-2 text-xs text-[var(--muted-foreground)]">
+                              {alIsAuto ? (
+                                <>Balance of the heat, filled in for you</>
+                              ) : (
+                                <>
+                                  Entered by hand
+                                  <button
+                                    type="button"
+                                    onClick={restoreAutoAluminium}
+                                    className="cursor-pointer font-medium text-[var(--primary)] hover:underline"
+                                  >
+                                    Use balance
+                                  </button>
+                                </>
+                              )}
+                            </p>
+                          )}
+                        </td>
+                        {/* The reading is the usual job; an addition is the
+                            exception. Twelve empty boxes for the exception
+                            made the table look like twice the work it is, so
+                            the box is asked for rather than always there. */}
+                        <td className="px-4 py-2.5">
+                          {gramsOpen.has(element.symbol) ? (
+                            <div className="flex items-center gap-1">
+                              <Input
+                                type="number"
+                                step="any"
+                                min="0"
+                                inputMode="decimal"
+                                placeholder="0"
+                                autoFocus
+                                value={grams}
+                                onChange={(e) =>
+                                  setElementGrams((current) => ({
+                                    ...current,
+                                    [element.symbol]: e.target.value,
+                                  }))
+                                }
+                              />
+                              <button
+                                type="button"
+                                title="No addition for this element"
+                                onClick={() => {
+                                  // Closing clears it: a hidden figure would
+                                  // still be saved, and nothing on screen
+                                  // would say so
+                                  setElementGrams((current) => ({
+                                    ...current,
+                                    [element.symbol]: "",
+                                  }));
+                                  setGramsOpen((current) => {
+                                    const next = new Set(current);
+                                    next.delete(element.symbol);
+                                    return next;
+                                  });
+                                }}
+                                className="shrink-0 cursor-pointer rounded p-1 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--error)]"
+                              >
+                                <X className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              title={`Record ${element.name} added to the melt`}
+                              onClick={() =>
+                                setGramsOpen((current) =>
+                                  new Set(current).add(element.symbol)
+                                )
+                              }
+                              className="flex cursor-pointer items-center gap-1 rounded-md border border-dashed border-[var(--border)] px-2 py-1.5 text-xs text-[var(--muted-foreground)] hover:border-[var(--primary)] hover:text-[var(--primary)]"
+                            >
+                              <Plus className="h-3.5 w-3.5" />
+                              Add
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             </div>
           </div>
 
@@ -1900,7 +2539,7 @@ export default function ProductionPage() {
           )}
 
           {/* Scrap generated - only known once the castings are off the line */}
-          {showOutput && (
+          {showScrap && (
           <>
           <div>
             <h4 className="font-medium text-[var(--foreground)] mb-3 flex items-center gap-2">
@@ -1916,30 +2555,51 @@ export default function ProductionPage() {
                   step="any"
                   placeholder="Weight in kg"
                   value={formData.runnerRaiserScrap}
-                  onChange={(e) =>
-                    setFormData({ ...formData, runnerRaiserScrap: e.target.value })
-                  }
+                  onChange={(e) => {
+                    setManualScrap((m) => new Set(m).add("runnerRaiserScrap"));
+                    setFormData({ ...formData, runnerRaiserScrap: e.target.value });
+                  }}
                   className="h-12"
                 />
                 {expectedFromParts.known && (
                   <p className="mt-1.5 text-xs font-medium text-amber-600">
-                    Expected for these castings:{" "}
-                    {formatWeight(expectedFromParts.scrap)}
+                    {manualScrap.has("runnerRaiserScrap")
+                      ? `These parts should give about ${formatWeight(expectedFromParts.runnerRaiser)}`
+                      : `We filled this in: ${formatWeight(expectedFromParts.runnerRaiser)}`}
                   </p>
                 )}
               </div>
-              <Input
-                label="Spillage"
-                type="number"
-                min="0"
-                step="any"
-                placeholder="Weight in kg"
-                value={formData.spillageScrap}
-                onChange={(e) =>
-                  setFormData({ ...formData, spillageScrap: e.target.value })
-                }
-                className="h-12"
-              />
+              <div>
+                <Input
+                  label="Spillage"
+                  type="number"
+                  min="0"
+                  step="any"
+                  placeholder="Weight in kg"
+                  value={formData.spillageScrap}
+                  onChange={(e) =>
+                    setFormData({ ...formData, spillageScrap: e.target.value })
+                  }
+                  className="h-12"
+                />
+                {/* The one scrap figure the castings cannot give: spillage is
+                    metal that never reached a mould. What is left unaccounted
+                    is the most it can be. */}
+                {expectedFromParts.known && completionCharge > 0 && (
+                  <p className="mt-1.5 text-xs font-medium text-amber-600">
+                    At most{" "}
+                    {formatWeight(
+                      Math.max(
+                        0,
+                        completionCharge -
+                          expectedFromParts.poured -
+                          parseWeightInput(formData.metalRemaining)
+                      )
+                    )}{" "}
+                    of metal is not accounted for yet
+                  </p>
+                )}
+              </div>
               <div>
                 <Input
                   label="Rejected Part Scrap"
@@ -1948,35 +2608,126 @@ export default function ProductionPage() {
                   step="any"
                   placeholder="Weight in kg"
                   value={formData.rejectedPartScrap}
-                  onChange={(e) =>
+                  onChange={(e) => {
+                    setManualScrap((m) => new Set(m).add("rejectedPartScrap"));
                     setFormData({
                       ...formData,
                       rejectedPartScrap: e.target.value,
-                    })
-                  }
+                    });
+                  }}
                   className="h-12"
                 />
                 {expectedFromParts.known && (
                   <p className="mt-1.5 text-xs font-medium text-amber-600">
-                    Pouring weight for these castings:{" "}
-                    {formatWeight(expectedFromParts.poured)}
+                    {manualScrap.has("rejectedPartScrap")
+                      ? `The bad parts weigh about ${formatWeight(expectedFromParts.rejectedPart)}`
+                      : `We filled this in: ${formatWeight(expectedFromParts.rejectedPart)}`}
                   </p>
                 )}
               </div>
             </div>
           </div>
 
-          {/* Notes - written up with the rest of the closing paperwork */}
-          <Textarea
-            label="Notes (Optional)"
-            placeholder="Add any notes about this production batch..."
-            value={formData.notes}
-            onChange={(e) =>
-              setFormData({ ...formData, notes: e.target.value })
-            }
-            className="min-h-[80px]"
-          />
+          {/* What is still in the furnace when this batch closes.
+              Its own section, because it is not scrap and not output - it is
+              metal that never left, and the next heat on this furnace can be
+              charged with it. */}
+          {/* On both stages: the castings decide the figure, and closing the
+              batch is the last chance to correct it before the next heat is
+              charged with whatever it says. */}
+          {showOutput && (
+            <div className="rounded-lg border border-amber-300 bg-amber-50 p-4">
+              <h4 className="mb-1 flex items-center gap-2 font-medium text-amber-900">
+                <Flame className="h-4 w-4" />
+                Metal left in the furnace
+              </h4>
+              <p className="mb-3 text-xs text-amber-800">
+                {formatWeight(completionCharge)} of metal went in and{" "}
+                {formatWeight(expectedFromParts.poured)} went into the parts.
+                Change the number below if the furnace has more or less than
+                this.
+              </p>
+              <div className="max-w-xs">
+                <Input
+                  label={`Left in the furnace (${WEIGHT_UNIT})`}
+                  type="number"
+                  min="0"
+                  step="any"
+                  /* No placeholder: this field is filled in with a real
+                     figure, and a grey "0" sitting in an empty box is
+                     indistinguishable from a calculated zero. */
+                  value={formData.metalRemaining}
+                  onChange={(e) => {
+                    setManualScrap((m) => new Set(m).add("metalRemaining"));
+                    setFormData({ ...formData, metalRemaining: e.target.value });
+                  }}
+                  className="h-12"
+                />
+                {/* Filled in as the counts are typed: everything charged less
+                    everything poured. Typing over it makes the difference melt
+                    loss. */}
+                {expectedFromParts.poured > 0 && (
+                  <p className="mt-1.5 text-xs font-medium text-amber-600">
+                    {/* The answer first, then where it came from - the sum
+                        alone left people wondering what it worked out to */}
+                    {manualScrap.has("metalRemaining") ? "We make it" : "We filled this in"}
+                    {": "}
+                    <span className="font-semibold">
+                      {formatWeight(suggestedRemaining)}
+                    </span>
+                    {suggestedRemaining <= 0
+                      ? " - all the metal was used for the parts"
+                      : ` - what is left after making the parts`}
+                    {/* A figure that was saved and no longer matches the sum -
+                        the admin gets to decide which is right */}
+                    {isAmending &&
+                      editingRecord?.metalRemaining !== null &&
+                      editingRecord?.metalRemaining !== undefined &&
+                      Math.abs(editingRecord.metalRemaining - suggestedRemaining) > 1 && (
+                        <span className="block text-[var(--muted-foreground)]">
+                          It was saved as{" "}
+                          {formatWeight(editingRecord.metalRemaining)} before.
+                          Type that again if it was right.
+                        </span>
+                      )}
+                  </p>
+                )}
+              </div>
+              {parseWeightInput(formData.metalRemaining) > 0 && (
+                <p className="mt-2 text-xs text-amber-800">
+                  This metal stays in the furnace. The next batch on this
+                  furnace can use it.
+                </p>
+              )}
+            </div>
+          )}
+
           </>
+          )}
+
+          {/* One note box, in the place a note belongs - the bottom of the
+              form - and shown on BOTH halves of writing the heat up. It used
+              to live inside the scrap block, so the castings stage had nowhere
+              to write the very note it was asking for. */}
+          {showOutput && (
+            <Textarea
+              label={
+                capacity.over ? "Note - please fill this in" : "Notes (Optional)"
+              }
+              error={
+                capacity.over && !formData.notes.trim()
+                  ? "Say why there are more parts than the metal can make"
+                  : undefined
+              }
+              placeholder={
+                capacity.over
+                  ? "For example: metal was added from another furnace, or the part weight is wrong"
+                  : "Add any notes about this production batch..."
+              }
+              value={formData.notes}
+              onChange={(e) => setFormData({ ...formData, notes: e.target.value })}
+              className="min-h-[80px]"
+            />
           )}
 
           {/* What this stage will do to stock, said plainly */}
@@ -2034,6 +2785,13 @@ export default function ProductionPage() {
                   ? `${enteredElementCount} element${enteredElementCount > 1 ? "s" : ""} recorded`
                   : "Both parts are optional - save what you measured"}
               </span>
+            ) : showParts && capacity.over ? (
+              <span className="flex items-center gap-2 text-amber-700">
+                <AlertTriangle className="h-4 w-4 shrink-0" />
+                <span className="truncate">
+                  Write a note to say why there are extra parts
+                </span>
+              </span>
             ) : partLines.length > 0 ? (
               <span className="text-[var(--muted-foreground)]">
                 {partLines.length} part{partLines.length > 1 ? "s" : ""}
@@ -2061,6 +2819,8 @@ export default function ProductionPage() {
                   ? handleRecordMelt
                   : batchModal === "amend"
                   ? handleAmendBatch
+                  : batchModal === "parts"
+                  ? handleRecordParts
                   : handleCompleteBatch
               }
               isLoading={isLoading}
@@ -2090,13 +2850,17 @@ export default function ProductionPage() {
         {selectedRecord && (() => {
           // Everything charged in, everything that came back out. Derived here
           // so the panel can show the balance rather than a pile of figures.
-          const charge =
-            selectedRecord.aluminumUsed + selectedRecord.totalScrapUsed;
+          const charge = chargeOf(selectedRecord);
           const outputWeight = selectedRecord.items.reduce(
             (sum, i) => sum + i.goodParts * (i.part.weightPerPiece ?? 0),
             0
           );
-          const accounted = outputWeight + selectedRecord.totalScrap;
+          // Metal still in the furnace is accounted for too - it did not
+          // vanish, it just never left
+          const accounted =
+            outputWeight +
+            selectedRecord.totalScrap +
+            (selectedRecord.metalRemaining ?? 0);
           const meltLoss = charge - accounted;
           // Output exceeding the charge is impossible, but a rounding-level gap
           // is not worth shouting about - only a material one is called out.
@@ -2211,12 +2975,41 @@ export default function ProductionPage() {
                       </span>
                     </div>
                   )}
+                  {(selectedRecord.carriedInWeight ?? 0) > 0 && (
+                    <div className="flex items-center justify-between px-4 py-2.5 text-sm">
+                      <span className="text-amber-700">
+                        Carried over from{" "}
+                        {selectedRecord.carriedFrom?.batchNumber ?? "the last heat"}
+                        <span className="ml-1 text-xs text-[var(--muted-foreground)]">
+                          (already out of stock)
+                        </span>
+                      </span>
+                      <span className="font-medium text-amber-700">
+                        {formatWeight(selectedRecord.carriedInWeight ?? 0)}
+                      </span>
+                    </div>
+                  )}
                   <div className="flex items-center justify-between border-y border-[var(--border)] bg-[var(--muted)] px-4 py-2.5 text-sm">
                     <span className="font-medium text-[var(--foreground)]">
                       Total charge
                     </span>
                     <span className="font-semibold">{formatWeight(charge)}</span>
                   </div>
+                  {(selectedRecord.metalRemaining ?? 0) > 0 && (
+                    <div className="flex items-center justify-between px-4 py-2.5 text-sm">
+                      <span className="text-amber-700">
+                        Left in the furnace
+                        <span className="ml-1 text-xs text-[var(--muted-foreground)]">
+                          {selectedRecord.carriedTo
+                            ? `(melted into ${selectedRecord.carriedTo.batchNumber})`
+                            : "(waiting for the next heat)"}
+                        </span>
+                      </span>
+                      <span className="font-medium text-amber-700">
+                        {formatWeight(selectedRecord.metalRemaining ?? 0)}
+                      </span>
+                    </div>
+                  )}
                   <div className="flex items-center justify-between px-4 py-2.5 text-sm">
                     <span className="text-[var(--muted-foreground)]">
                       Good castings out

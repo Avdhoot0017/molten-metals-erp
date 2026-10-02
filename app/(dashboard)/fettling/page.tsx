@@ -28,6 +28,11 @@ import { StatCard } from "@/components/ui/stat-card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { formatDate } from "@/lib/utils";
 import {
+  announcePiecesChanged,
+  useRefreshOnChange,
+  useLatestRequest,
+} from "@/lib/live-updates";
+import {
   parseWeightInput,
   weightToInput,
   formatWeight,
@@ -42,6 +47,13 @@ interface PartRef {
   partCode: string;
   /** Grams. Used to work out what rejects weigh when nobody weighed them. */
   weightPerPiece: number;
+  /** The stations this part passes through, in order. */
+  routeSteps?: Array<{
+    id: string;
+    sequence: number;
+    activityTypeId: string;
+    activityType: { id: string; name: string };
+  }>;
 }
 
 interface ActivityItem {
@@ -51,6 +63,10 @@ interface ActivityItem {
   partsRejected: number;
   /** Weighed scrap in grams; null where the calculation was left to stand. */
   rejectedWeight: number | null;
+  routeStepId: string | null;
+  reworkQty: number;
+  reworkFromStepId: string | null;
+  returnStepId: string | null;
   part: PartRef;
 }
 
@@ -89,6 +105,15 @@ interface DraftLine {
   partsRejected: string;
   /** Weighed scrap in kg as typed. Blank means "use the calculation". */
   rejectedWeight: string;
+  /**
+   * Which queue this work draws from: "STEP:<id>" for the route, or
+   * "REWORK:<id>" for repairing what a station rejected.
+   */
+  source: string;
+  /** Of the rejects, how many are worth repairing rather than melting. */
+  reworkQty: string;
+  /** Where repaired pieces rejoin the route. Blank means "where they failed". */
+  returnTo: string;
 }
 
 /** Today's date as YYYY-MM-DD in the browser's timezone. */
@@ -109,6 +134,26 @@ export default function FettlingPage() {
   const [sheet, setSheet] = React.useState<DaySheet | null>(null);
   const [role, setRole] = React.useState<UserRole | null>(null);
   const [activityTypes, setActivityTypes] = React.useState<ActivityType[]>([]);
+  /**
+   * How many pieces of each part are standing at each station.
+   *
+   * Shown against every line so the operator sees the queue before typing into
+   * it. The entry is refused if it exceeds what is there, and a refusal nobody
+   * could have seen coming is just an obstacle.
+   */
+  const [stages, setStages] = React.useState<
+    Array<{
+      partId: string;
+      stageKey: string;
+      quantity: number;
+      kind: string;
+      routeStep: {
+        sequence: number;
+        activityTypeId: string;
+        activityType: { id: string; name: string };
+      } | null;
+    }>
+  >([]);
   const [parts, setParts] = React.useState<PartRef[]>([]);
 
   const [isPageLoading, setIsPageLoading] = React.useState(true);
@@ -122,6 +167,16 @@ export default function FettlingPage() {
   const [formError, setFormError] = React.useState<string | null>(null);
 
   const [formActivityTypeId, setFormActivityTypeId] = React.useState("");
+  /** Pieces the entry being edited already took, per part and queue. */
+  const [ownTaken, setOwnTaken] = React.useState<Map<string, number>>(new Map());
+  /**
+   * Part lines where the operator set the repair/melt split themselves.
+   *
+   * Everything else follows the rejected count: a casting that just failed is
+   * a candidate for the welding bench until somebody says otherwise, and
+   * melting it is the decision that cannot be taken back.
+   */
+  const [manualRework, setManualRework] = React.useState<Set<string>>(new Set());
   const [formNotes, setFormNotes] = React.useState("");
   const [lines, setLines] = React.useState<DraftLine[]>([]);
   const [partToAdd, setPartToAdd] = React.useState("");
@@ -129,41 +184,82 @@ export default function FettlingPage() {
   const canManage = role ? canWrite({ role }, "fettling") : false;
   const editable = (sheet?.editable ?? false) && canManage;
 
-  const loadSheet = React.useCallback(async (targetDate: string) => {
-    const res = await fetch(`/api/fettling/daily?date=${targetDate}`);
-    const result = await res.json();
-    if (result.success) {
-      setSheet(result.data);
-      setError(null);
-    } else {
-      setError(result.error || "Failed to load the day");
+  const sheetRequest = useLatestRequest();
+  const loadSheet = React.useCallback(
+    async (targetDate: string) => {
+      // Flicking between days quickly sends several requests; only the last
+      // one asked for may land, or an older day's figures reappear
+      const ticket = sheetRequest.next();
+      const res = await fetch(`/api/fettling/daily?date=${targetDate}`);
+      const result = await res.json();
+      if (!sheetRequest.isLatest(ticket)) return;
+      if (result.success) {
+        setSheet(result.data);
+        setError(null);
+      } else {
+        setError(result.error || "Failed to load the day");
+      }
+    },
+    [sheetRequest]
+  );
+
+  /**
+   * The station queues and part routes - everything the "N waiting" badges
+   * and the queue choices are built from.
+   *
+   * Used to be read once when the page opened, so after Ganesh's riser
+   * cutting was saved, Mohan's belt-sander line still said "none waiting"
+   * until the page was refreshed. It is now reloaded after every save and
+   * delete, whenever an entry is opened, and when anything changes elsewhere.
+   */
+  const flowRequest = useLatestRequest();
+  const loadFlow = React.useCallback(async () => {
+    const ticket = flowRequest.next();
+    try {
+      const [partsRes, stagesRes] = await Promise.all([
+        fetch("/api/parts"),
+        fetch("/api/parts/stages"),
+      ]);
+      const partsData = await partsRes.json();
+      const stagesData = await stagesRes.json();
+      if (!flowRequest.isLatest(ticket)) return;
+      if (stagesData.success) setStages(stagesData.data || []);
+      if (partsData.success) {
+        const list = Array.isArray(partsData.data)
+          ? partsData.data
+          : partsData.data?.parts ?? [];
+        setParts(list);
+      }
+    } catch {
+      // The badges keep their last figures; the server still refuses an
+      // entry that exceeds the real queue
     }
-  }, []);
+  }, [flowRequest]);
+
+  const refreshAll = React.useCallback(async () => {
+    await Promise.all([loadSheet(date), loadFlow()]);
+  }, [date, loadSheet, loadFlow]);
+
+  // Another tab saved something, or this one came back into view
+  useRefreshOnChange(refreshAll);
 
   React.useEffect(() => {
     void (async () => {
       try {
-        const [sessionRes, typesRes, partsRes] = await Promise.all([
+        const [sessionRes, typesRes] = await Promise.all([
           fetch("/api/auth/session"),
           fetch("/api/activity-types"),
-          fetch("/api/parts"),
+          loadFlow(),
         ]);
         const sessionData = await sessionRes.json();
         const typesData = await typesRes.json();
-        const partsData = await partsRes.json();
         if (sessionData.success) setRole(sessionData.user.role);
         if (typesData.success) setActivityTypes(typesData.data || []);
-        if (partsData.success) {
-          const list = Array.isArray(partsData.data)
-            ? partsData.data
-            : partsData.data?.parts ?? [];
-          setParts(list);
-        }
       } catch {
         // These only decide what the form offers; the API validates regardless
       }
     })();
-  }, []);
+  }, [loadFlow]);
 
   React.useEffect(() => {
     void (async () => {
@@ -197,6 +293,109 @@ export default function FettlingPage() {
   const recorded = sheet?.rows.filter((r) => r.activityId) ?? [];
   const pending = sheet?.rows.filter((r) => !r.activityId) ?? [];
 
+  /** Pieces standing in one queue right now. */
+  const queueSize = React.useCallback(
+    (partId: string, stageKey: string) =>
+      stages.find((s) => s.partId === partId && s.stageKey === stageKey)
+        ?.quantity ?? 0,
+    [stages]
+  );
+
+  /**
+   * What an entry can draw from a queue: what is there now, plus whatever the
+   * entry being edited already took from it. Without the second part, re-
+   * opening a saved entry shows its own station empty.
+   */
+  const availableIn = React.useCallback(
+    (partId: string, stageKey: string) =>
+      queueSize(partId, stageKey) + (ownTaken.get(`${partId}|${stageKey}`) ?? 0),
+    [queueSize, ownTaken]
+  );
+
+  /**
+   * The queues this employee could be working from, for one part.
+   *
+   * Built from the part's ROUTE, not from whichever stations happen to hold
+   * pieces: a station with an empty queue is still a real choice (and the one
+   * an edited entry emptied must stay selectable). Repair piles are offered
+   * when they hold pieces, or when this entry already drew from them.
+   */
+  const sourcesFor = React.useCallback(
+    (partId: string) => {
+      const route = parts.find((p) => p.id === partId)?.routeSteps ?? [];
+      const options: Array<{ value: string; label: string; available: number }> = [];
+
+      const own = route.find((r) => r.activityTypeId === formActivityTypeId);
+      if (own) {
+        const key = `STEP:${own.id}`;
+        const available = availableIn(partId, key);
+        options.push({
+          value: key,
+          label: `${own.activityType.name} queue - ${available} waiting`,
+          available,
+        });
+      }
+
+      for (const step of route) {
+        const key = `REWORK:${step.id}`;
+        const available = availableIn(partId, key);
+        if (available <= 0) continue;
+        options.push({
+          value: key,
+          label: `Repair - rejected at ${step.activityType.name} (${available})`,
+          available,
+        });
+      }
+
+      return options;
+    },
+    [parts, formActivityTypeId, availableIn]
+  );
+
+  /*
+   * Keep each line pointed at the right queue when the process changes.
+   *
+   * A line's queue was chosen when the part was added; switching the process
+   * afterwards left route lines drawing from the OLD station. Route lines now
+   * follow the process. Repair lines are left alone - which pile a welder is
+   * working on does not depend on what the process is called.
+   */
+  React.useEffect(() => {
+    setLines((current) => {
+      let changed = false;
+      const next = current.map((line) => {
+        if (line.source.startsWith("REWORK:")) return line;
+        const resolved = sourcesFor(line.partId)[0]?.value ?? "";
+        if (resolved === line.source) return line;
+        changed = true;
+        return { ...line, source: resolved, returnTo: "" };
+      });
+      return changed ? next : current;
+    });
+    // Re-resolve on a process change (or once routes load), not on every
+    // count update - a queue's size does not change which queue it is
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [formActivityTypeId, parts]);
+
+  /**
+   * Where a repaired piece can rejoin: any station on the part's route.
+   *
+   * A weld can undo work that has to be redone, or leave the casting ready for
+   * a later stage - the bench decides, so every step is offered and the one
+   * that rejected it is only the default.
+   */
+  const returnOptionsFor = React.useCallback(
+    (partId: string, source: string) => {
+      if (!source.startsWith("REWORK:")) return [];
+      const stepId = source.slice("REWORK:".length);
+      const part = parts.find((p) => p.id === partId);
+      const route = part?.routeSteps ?? [];
+      if (!route.some((r) => r.id === stepId)) return [];
+      return route;
+    },
+    [parts]
+  );
+
   const draftTotals = lines.reduce(
     (acc, l) => {
       const done = parseInt(l.partsCompleted) || 0;
@@ -207,6 +406,35 @@ export default function FettlingPage() {
   );
 
   const openEntry = (row: DayRow) => {
+    // Someone else may have moved pieces since the page loaded
+    void loadFlow();
+    /*
+     * What this entry already took from each queue.
+     *
+     * The queues on screen are AFTER this entry was applied, so re-opening a
+     * saved "10 done" would show the station empty and flag the line red -
+     * though saving it unchanged moves nothing. Adding its own pieces back
+     * gives the figure the operator is actually working against.
+     */
+    // A saved line already says how its rejects were split - that decision was
+    // made at the bench and must not be restated by the default above
+    setManualRework(
+      new Set(row.items.filter((i) => i.partsRejected > 0).map((i) => i.partId))
+    );
+    setOwnTaken(
+      new Map(
+        row.items.map((i) => [
+          `${i.partId}|${
+            i.reworkFromStepId
+              ? `REWORK:${i.reworkFromStepId}`
+              : i.routeStepId
+              ? `STEP:${i.routeStepId}`
+              : ""
+          }`,
+          i.partsCompleted,
+        ])
+      )
+    );
     setEditing(row);
     setFormError(null);
     setPartToAdd("");
@@ -219,11 +447,20 @@ export default function FettlingPage() {
         partsRejected: i.partsRejected ? String(i.partsRejected) : "",
         rejectedWeight:
           i.rejectedWeight === null ? "" : weightToInput(i.rejectedWeight),
+        source: i.reworkFromStepId
+          ? `REWORK:${i.reworkFromStepId}`
+          : i.routeStepId
+          ? `STEP:${i.routeStepId}`
+          : "",
+        reworkQty: i.reworkQty ? String(i.reworkQty) : "",
+        returnTo: i.returnStepId ?? "",
       }))
     );
   };
 
   const closeEntry = () => {
+    setOwnTaken(new Map());
+    setManualRework(new Set());
     setEditing(null);
     setLines([]);
     setFormError(null);
@@ -233,7 +470,16 @@ export default function FettlingPage() {
     if (!partId) return;
     setLines((current) => [
       ...current,
-      { partId, partsCompleted: "", partsRejected: "", rejectedWeight: "" },
+      {
+        partId,
+        partsCompleted: "",
+        partsRejected: "",
+        rejectedWeight: "",
+        // The station's own queue by default; repair work is the exception
+        source: sourcesFor(partId)[0]?.value ?? "",
+        reworkQty: "",
+        returnTo: "",
+      },
     ]);
     setPartToAdd("");
   };
@@ -243,6 +489,31 @@ export default function FettlingPage() {
       current.map((l) => (l.partId === partId ? { ...l, ...patch } : l))
     );
   };
+
+  /*
+   * Keep "send for repair" level with the rejected count until it is edited.
+   *
+   * Defaulting the other way - everything to the melt - meant a mis-typed
+   * count melted castings that a weld could have saved, and the metal cannot
+   * be uncast. Repair is the reversible default; the melt is one edit away.
+   */
+  React.useEffect(() => {
+    setLines((current) => {
+      let changed = false;
+      const next = current.map((line) => {
+        if (manualRework.has(line.partId)) return line;
+        // A repair line's own failures go to the melt - a piece that could not
+        // be saved at the bench does not go back to it
+        if (line.source.startsWith("REWORK:")) return line;
+        const rejected = parseInt(line.partsRejected) || 0;
+        const wanted = rejected > 0 ? String(rejected) : "";
+        if (wanted === line.reworkQty) return line;
+        changed = true;
+        return { ...line, reworkQty: wanted };
+      });
+      return changed ? next : current;
+    });
+  }, [lines, manualRework]);
 
   const removeLine = (partId: string) => {
     setLines((current) => current.filter((l) => l.partId !== partId));
@@ -269,6 +540,20 @@ export default function FettlingPage() {
         );
         return;
       }
+      /*
+       * Melted pieces are stock being created, so they are weighed.
+       *
+       * Falling back to count x nominal weight was fine while this was only a
+       * figure on a report; it is inventory now, and a reject is often a
+       * part-filled pour or already broken up.
+       */
+      const melting = Math.max(0, rej - (parseInt(line.reworkQty) || 0));
+      if (melting > 0 && line.rejectedWeight.trim() === "") {
+        setFormError(
+          `Weigh the ${melting} piece${melting === 1 ? "" : "s"} of ${part?.partCode ?? "that part"} going to the melt - that weight is what goes into stock`
+        );
+        return;
+      }
     }
 
     setIsSaving(true);
@@ -289,6 +574,9 @@ export default function FettlingPage() {
           l.rejectedWeight.trim() === ""
             ? null
             : parseWeightInput(l.rejectedWeight),
+        source: l.source || null,
+        reworkQty: parseInt(l.reworkQty) || 0,
+        returnTo: l.returnTo || null,
       })),
     };
 
@@ -303,7 +591,9 @@ export default function FettlingPage() {
       });
       const result = await res.json();
       if (result.success) {
-        await loadSheet(date);
+        // The sheet AND the queues - saving moved pieces between stations
+        await refreshAll();
+        announcePiecesChanged();
         closeEntry();
       } else {
         setFormError(result.error || "Failed to save");
@@ -324,7 +614,8 @@ export default function FettlingPage() {
       });
       const result = await res.json();
       if (result.success) {
-        await loadSheet(date);
+        await refreshAll();
+        announcePiecesChanged();
       } else {
         setError(result.error || "Failed to remove the entry");
       }
@@ -678,9 +969,22 @@ export default function FettlingPage() {
                   const done = parseInt(line.partsCompleted) || 0;
                   const rej = parseInt(line.partsRejected) || 0;
                   const over = rej > done;
+                  const sources = sourcesFor(line.partId);
+                  const chosen = sources.find((o) => o.value === line.source);
+                  const isRepair = line.source.startsWith("REWORK:");
+                  // However many are in whichever queue this draws from
+                  // Edit-aware: includes what this entry already took
+                  const waiting = chosen?.available ?? 0;
+                  // The server refuses this; saying so here saves the trip
+                  const overQueue = done > waiting;
+                  const toRepair = parseInt(line.reworkQty) || 0;
+                  const toMelt = Math.max(0, rej - toRepair);
+                  const returnOptions = returnOptionsFor(line.partId, line.source);
+                  // Only melted pieces are scrap metal - one on the repair
+                  // bench is still a casting
+                  const calculated = toMelt * (part?.weightPerPiece ?? 0);
                   // What whole castings would weigh. Offered as the placeholder
                   // so the operator sees the figure their entry replaces.
-                  const calculated = rej * (part?.weightPerPiece ?? 0);
 
                   return (
                     <div
@@ -695,6 +999,18 @@ export default function FettlingPage() {
                           <span className="ml-2 text-sm font-medium">
                             {part?.name}
                           </span>
+                          {/* The queue at this station. These are the same
+                              pieces the previous station passed on - not new
+                              ones, which is what used to get double counted. */}
+                          <span
+                            className={`ml-2 rounded px-1.5 py-0.5 text-xs ${
+                              waiting > 0
+                                ? "bg-blue-50 text-blue-700"
+                                : "bg-amber-50 text-amber-700"
+                            }`}
+                          >
+                            {waiting} waiting
+                          </span>
                         </span>
                         <Button
                           variant="ghost"
@@ -706,12 +1022,42 @@ export default function FettlingPage() {
                         </Button>
                       </div>
 
-                      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                      {/* Which queue this work draws from. Repair work comes
+                          off another station's reject pile, not this one's
+                          queue, so it has to be named rather than assumed. */}
+                      {sources.length > 1 && (
+                        <div className="mb-3">
+                          <Select
+                            label="Working on"
+                            options={sources.map((o) => ({
+                              value: o.value,
+                              label: o.label,
+                            }))}
+                            value={line.source}
+                            onChange={(value) =>
+                              updateLine(line.partId, {
+                                source: value,
+                                // The return step belongs to the old queue
+                                returnTo: "",
+                              })
+                            }
+                          />
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-3 gap-3">
                         <Input
                           label="Done"
                           type="number"
                           min="0"
                           placeholder="0"
+                          error={
+                            overQueue
+                              ? waiting === 0
+                                ? "None waiting here"
+                                : `Only ${waiting} waiting`
+                              : undefined
+                          }
                           value={line.partsCompleted}
                           onChange={(e) =>
                             updateLine(line.partId, {
@@ -732,27 +1078,6 @@ export default function FettlingPage() {
                             })
                           }
                         />
-                        {/* The bench scale beats the arithmetic when there is
-                            a reading: a reject can be a part-filled pour, so
-                            the count does not always give its weight. Left
-                            blank, the calculated figure below is what gets
-                            booked. */}
-                        <Input
-                          label={`Rejected Scrap (${WEIGHT_UNIT})`}
-                          type="number"
-                          min="0"
-                          step="any"
-                          disabled={rej === 0}
-                          placeholder={
-                            rej === 0 ? "-" : weightToInput(calculated)
-                          }
-                          value={line.rejectedWeight}
-                          onChange={(e) =>
-                            updateLine(line.partId, {
-                              rejectedWeight: e.target.value,
-                            })
-                          }
-                        />
                         {/* Accepted is shown, never typed - it is the
                             difference, so it cannot be entered wrong */}
                         <div>
@@ -765,17 +1090,140 @@ export default function FettlingPage() {
                         </div>
                       </div>
 
-                      {rej > 0 && (
+                      {/* Rejected does not have to mean melted: a weld can
+                          save a casting, and melting it would put good metal
+                          back in the furnace for nothing. */}
+                      {rej > 0 && !isRepair && (
+                        <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3">
+                          <p className="mb-2 text-xs font-medium text-amber-900">
+                            What happens to the {rej} rejected
+                          </p>
+                          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                            <Input
+                              label="Send for repair"
+                              type="number"
+                              min="0"
+                              max={rej}
+                              placeholder="0"
+                              error={toRepair > rej ? "More than rejected" : undefined}
+                              value={line.reworkQty}
+                              onChange={(e) => {
+                                setManualRework((m) => new Set(m).add(line.partId));
+                                updateLine(line.partId, { reworkQty: e.target.value });
+                              }}
+                            />
+                            {/* Either side can be typed - some benches count
+                                what they are saving, others count what they
+                                are throwing. The two always add up to the
+                                rejected count, so setting one sets the other. */}
+                            <Input
+                              label="To the melt"
+                              type="number"
+                              min="0"
+                              max={rej}
+                              placeholder="0"
+                              value={String(toMelt)}
+                              onChange={(e) => {
+                                setManualRework((m) => new Set(m).add(line.partId));
+                                const typed = parseInt(e.target.value);
+                                const melt = Number.isFinite(typed)
+                                  ? Math.min(Math.max(0, typed), rej)
+                                  : 0;
+                                updateLine(line.partId, {
+                                  reworkQty: String(rej - melt),
+                                });
+                              }}
+                            />
+                            {/* The weight that actually goes into rejected-part
+                                stock. Required, not optional: this metal is
+                                being added to inventory, and a count times a
+                                nominal weight is not a stock figure - a reject
+                                can be a part-filled pour or already broken up.
+                                It sits next to the melt count because that is
+                                the only thing it describes. */}
+                            <div>
+                              <Input
+                                label={`Weight to melt (${WEIGHT_UNIT})`}
+                                type="number"
+                                min="0"
+                                step="any"
+                                disabled={toMelt === 0}
+                                required={toMelt > 0}
+                                placeholder={toMelt === 0 ? "-" : "0"}
+                                error={
+                                  toMelt > 0 && line.rejectedWeight.trim() === ""
+                                    ? "Enter the weight"
+                                    : undefined
+                                }
+                                value={line.rejectedWeight}
+                                onChange={(e) =>
+                                  updateLine(line.partId, {
+                                    rejectedWeight: e.target.value,
+                                  })
+                                }
+                              />
+                              {/* No figure is filled in here on purpose: this
+                                  weight is added to scrap stock, and a number
+                                  nobody weighed would be stock nobody has. */}
+                              {toMelt > 0 && (
+                                <p className="mt-1 text-xs text-amber-700">
+                                  Must be filled in - weigh these pieces.
+                                </p>
+                              )}
+                            </div>
+                          </div>
+                          <p className="mt-1.5 text-xs text-amber-800">
+                            {toRepair > 0 && toMelt > 0
+                              ? `${toRepair} wait for repair and can rejoin the route. The ${toMelt} melted are added to rejected-part stock at the weight above.`
+                              : toRepair > 0
+                              ? `All ${rej} wait for repair - nothing is melted, so no scrap is added to stock.`
+                              : `All ${rej} go to the melt and are added to rejected-part stock at the weight above. That cannot be undone.`}
+                          </p>
+                        </div>
+                      )}
+
+                      {/* Where a repaired piece rejoins the line. Never after
+                          the step that rejected it - that check has to be
+                          repeated before the part can ship. */}
+                      {/* Repaired pieces have to be put somewhere, and only
+                          the bench knows where a welded casting picks up. */}
+                      {isRepair && returnOptions.length > 0 && (
+                        <div className="mt-3 rounded-lg border border-blue-200 bg-blue-50 p-3">
+                          <Select
+                            label="Put repaired pieces into"
+                            options={returnOptions.map((r) => ({
+                              value: r.id,
+                              label: `${r.sequence}. ${r.activityType.name}${
+                                r.id === line.source.slice("REWORK:".length)
+                                  ? " (where they failed)"
+                                  : ""
+                              }`,
+                            }))}
+                            value={
+                              line.returnTo || line.source.slice("REWORK:".length)
+                            }
+                            onChange={(value) =>
+                              updateLine(line.partId, { returnTo: value })
+                            }
+                          />
+                          <p className="mt-1.5 text-xs text-blue-800">
+                            Any station on this part&apos;s route. Sending them
+                            past the step that rejected them means that check is
+                            not repeated.
+                          </p>
+                        </div>
+                      )}
+
+                      {toMelt > 0 && (
                         <p className="mt-2 text-xs text-[var(--muted-foreground)]">
                           {line.rejectedWeight.trim() === "" ? (
                             <>
-                              Booking{" "}
+                              Adding{" "}
                               <span className="font-medium text-[var(--foreground)]">
                                 {formatWeight(calculated)}
                               </span>{" "}
-                              to rejected scrap &mdash; {rej} x{" "}
-                              {formatWeight(part?.weightPerPiece ?? 0)}. Enter a
-                              weight to use the real one instead.
+                              of scrap to stock &mdash; {toMelt} x{" "}
+                              {formatWeight(part?.weightPerPiece ?? 0)}.
                             </>
                           ) : (
                             <>
