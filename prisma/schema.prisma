@@ -311,8 +311,18 @@ model FettlingActivityItem {
   reworkFromStep PartRouteStep? @relation("ItemReworkFrom", fields: [reworkFromStepId], references: [id])
   returnStep     PartRouteStep? @relation("ItemReturnTo", fields: [returnStepId], references: [id])
 
-  // A part appears once per day's record; a second entry would be ambiguous
-  @@unique([activityId, partId])
+  /*
+   * Uniqueness lives in the database as two PARTIAL indexes, which Prisma
+   * cannot express here (it has no "where" on @@unique):
+   *
+   *   one row per part for ROUTE work          (reworkFromStepId IS NULL)
+   *   one row per part PER PILE for repair     (reworkFromStepId IS NOT NULL)
+   *
+   * A welder working a part's rejects from two different stations needs a row
+   * for each; a second row for the SAME pile is still refused, which is what
+   * stops the same pieces being counted twice. See the migration
+   * 20261004000000_repair_rows_per_pile.
+   */
   @@index([activityId])
   @@index([partId])
   @@map("fettling_activity_items")
