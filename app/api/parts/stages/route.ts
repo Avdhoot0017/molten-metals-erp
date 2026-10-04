@@ -39,6 +39,9 @@ export async function GET(request: NextRequest) {
         kind: true,
         routeStepId: true,
         quantity: true,
+        // When this queue last changed - enough to say "these have been
+        // sitting here since Tuesday" without replaying the whole ledger
+        lastUpdated: true,
         routeStep: {
           select: {
             sequence: true,

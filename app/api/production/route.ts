@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 import { formatWeight } from "@/lib/units";
 import { getSession } from "@/lib/auth";
-import { canRead, canWrite } from "@/lib/permissions";
+import { canRead, canWrite, canAmendCompletedBatch } from "@/lib/permissions";
 import { parsePagination, buildPaginationMeta } from "@/lib/pagination";
 import { materialType, isIngotType, gradeName } from "@/lib/ingot";
 import type { AluminumType } from "@/types";
@@ -215,6 +215,17 @@ const body = await request.json();
       carriedFromId,
       // The shop-floor employee who ran this heat
       operatorId,
+      /*
+       * Writing up a heat that ran weeks ago - admin only.
+       *
+       * The month's numbering is part of the record, so a batch from last
+       * month has to carry last month's number and date. Both are taken from
+       * the caller rather than invented, and both are checked: the number must
+       * be free and must belong to the month the date falls in, or the
+       * sequence stops meaning anything.
+       */
+      batchNumber: requestedNumber,
+      date: requestedDate,
       notes,
     } = body;
 
@@ -418,6 +429,64 @@ const body = await request.json();
       operator = { id: found.id, name: found.name };
     }
 
+    /*
+     * A backdated entry is a correction to the record, not routine work, so it
+     * is held to the same bar as amending a completed batch: admins only.
+     */
+    let backdated: { batchNumber: string; date: Date } | null = null;
+    if (requestedNumber || requestedDate) {
+      if (!canAmendCompletedBatch(session)) {
+        return NextResponse.json(
+          { error: "Only an admin can add a batch for an earlier date" },
+          { status: 403 }
+        );
+      }
+
+      const when = requestedDate ? new Date(String(requestedDate)) : new Date();
+      if (Number.isNaN(when.getTime())) {
+        return NextResponse.json(
+          { error: "That date is not a real date" },
+          { status: 400 }
+        );
+      }
+      // A heat cannot have run after today
+      if (when.getTime() > Date.now()) {
+        return NextResponse.json(
+          { error: "A batch cannot be dated in the future" },
+          { status: 400 }
+        );
+      }
+
+      const prefix = batchPrefix(when);
+      const number = String(requestedNumber ?? "").trim().toUpperCase();
+      const sequence = sequenceOf(number, prefix);
+      if (sequence === null) {
+        return NextResponse.json(
+          {
+            error: `Batch number must be ${prefix} followed by two digits for that month - for example ${formatBatchNumber(prefix, 1)}`,
+          },
+          { status: 400 }
+        );
+      }
+
+      const clash = await prisma.productionRecord.findUnique({
+        where: { batchNumber: number },
+        select: { date: true },
+      });
+      if (clash) {
+        // Say which number IS free, so the next attempt is not another guess
+        const free = await nextBatchNumber(when);
+        return NextResponse.json(
+          {
+            error: `Batch ${number} already exists (recorded ${clash.date.toISOString().slice(0, 10)}). The next free number for that month is ${free}.`,
+          },
+          { status: 409 }
+        );
+      }
+
+      backdated = { batchNumber: number, date: when };
+    }
+
     // Something has to go into the furnace, but it does not have to be fresh
     // ingot - a heat run entirely on re-melted scrap, or entirely on what the
     // last heat left behind, is ordinary foundry work. So the requirement is on
@@ -470,11 +539,23 @@ const body = await request.json();
     // same instant would work out the same number, and the unique constraint
     // is what decides which one got there first. Recomputing on a clash is
     // simpler and safer than holding a lock or a separate counter table.
-    const result = await runWithBatchNumber(async (batchNumber, tx) => {
+    /*
+     * A backdated batch brings its own number, so the allocator is skipped -
+     * it exists to hand out the NEXT number, and that is not what is wanted
+     * here. The unique constraint still has the final say if two people claim
+     * the same number at the same moment.
+     */
+    const withNumber = backdated
+      ? <T,>(work: (n: string, tx: Prisma.TransactionClient) => Promise<T>) =>
+          prisma.$transaction((tx) => work(backdated!.batchNumber, tx))
+      : runWithBatchNumber;
+
+    const result = await withNumber(async (batchNumber, tx) => {
       // Create production record
       const record = await tx.productionRecord.create({
         data: {
           batchNumber,
+          ...(backdated ? { date: backdated.date } : {}),
           furnaceId,
           // The batch opens as PENDING: the metal is in the furnace, nothing
           // has come out of it yet. Output, scrap and assay stay at their
@@ -571,6 +652,24 @@ const body = await request.json();
 
     return NextResponse.json({ success: true, data: result }, { status: 201 });
   } catch (error) {
+    /*
+     * Two people claiming one number at the same moment.
+     *
+     * The check before saving catches the ordinary case; this catches the
+     * gap between that check and the write, where the database is the only
+     * thing that can decide. Only backdated batches can land here - the
+     * allocator retries on a clash by itself.
+     */
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === "P2002" &&
+      String(error.meta?.target ?? "").includes("batchNumber")
+    ) {
+      return NextResponse.json(
+        { error: "That batch number was just taken. Try the next one." },
+        { status: 409 }
+      );
+    }
     console.error("Error creating production record:", error);
     return NextResponse.json(
       { error: "Failed to create production record" },

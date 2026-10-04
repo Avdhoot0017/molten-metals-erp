@@ -4,6 +4,7 @@ import * as React from "react";
 import {
   ArrowRight,
   Factory,
+  PackageCheck,
   Plus,
   Search,
   Filter,
@@ -111,6 +112,7 @@ const SCRAP_USED_FIELD: Record<
 import type { AluminumType } from "@/types";
 import {
   MAX_OPEN_BATCHES_PER_FURNACE,
+  batchPrefix,
   castingOutput,
   chargeOf,
   suggestedHeel,
@@ -309,6 +311,8 @@ export default function ProductionPage() {
   const [formData, setFormData] = React.useState({
     furnaceId: "",
     operatorId: "",
+    batchNumber: "",
+    batchDate: "",
     // A heat is charged with one alloy, so the grade is picked once and the
     // weight is entered against it. The API still takes a per-grade split;
     // the other two grades go over as zero.
@@ -653,6 +657,8 @@ export default function ProductionPage() {
     setFormData({
       furnaceId: "",
       operatorId: "",
+      batchNumber: "",
+      batchDate: "",
       ingotGrade: "INGOT_LM6" as AluminumType,
       aluminumUsed: "",
       runnerRaiserScrapUsed: "",
@@ -915,9 +921,16 @@ export default function ProductionPage() {
    */
   const [manualScrap, setManualScrap] = React.useState<Set<string>>(new Set());
   React.useEffect(() => {
-    // Amending fills it in as well: an older batch has no figure to preserve,
-    // and the effect leaves anything already entered alone
-    if (batchModal !== "complete" && batchModal !== "amend") return;
+    /*
+     * Each figure fills in on the stage that shows it.
+     *
+     * This guard used to name "complete" and "amend" only - written before the
+     * castings and the scrap became separate stages. The leftover then moved
+     * to the castings stage, which this did not list, so the field sat empty
+     * there and saved as 0: a furnace with 100 kg still in it recorded as
+     * empty, and the next heat offered nothing to carry over.
+     */
+    if (!showParts && !showScrap) return;
     if (expectedFromParts.poured <= 0) return;
     setFormData((prev) => ({
       ...prev,
@@ -929,7 +942,8 @@ export default function ProductionPage() {
        * poured, and the castings' own weight is a floor for that even when the
        * gating was never measured. So it fills itself in either way.
        */
-      ...(expectedFromParts.known
+      // Scrap is weighed at the closing stage, so it fills in there
+      ...(showScrap && expectedFromParts.known
         ? {
             runnerRaiserScrap: manualScrap.has("runnerRaiserScrap")
               ? prev.runnerRaiserScrap
@@ -939,9 +953,14 @@ export default function ProductionPage() {
               : weightToInput(expectedFromParts.rejectedPart),
           }
         : {}),
-      metalRemaining: manualScrap.has("metalRemaining")
-        ? prev.metalRemaining
-        : weightToInput(suggestedRemaining),
+      // What is left in the furnace is asked for with the castings
+      ...(showParts
+        ? {
+            metalRemaining: manualScrap.has("metalRemaining")
+              ? prev.metalRemaining
+              : weightToInput(suggestedRemaining),
+          }
+        : {}),
     }));
   }, [batchModal, expectedFromParts, suggestedRemaining, manualScrap]);
 
@@ -1001,6 +1020,14 @@ export default function ProductionPage() {
       furnaceId: formData.furnaceId,
       // Blank is allowed - the batch matters more than the label on it
       operatorId: formData.operatorId || null,
+      // Only sent when writing up an earlier day; the server refuses these
+      // from anyone but an admin
+      ...(backdating
+        ? {
+            batchNumber: formData.batchNumber.trim(),
+            date: formData.batchDate || undefined,
+          }
+        : {}),
       // The server re-reads the weight from that batch rather than trusting a
       // number from here - it is metal, and only one heat may have it.
       // Resolved (not the raw state) so the compulsory default heel is carried
@@ -1106,8 +1133,8 @@ export default function ProductionPage() {
       runnerRaiserScrap: parseWeightInput(formData.runnerRaiserScrap),
       spillageScrap: parseWeightInput(formData.spillageScrap),
       rejectedPartScrap: parseWeightInput(formData.rejectedPartScrap),
-      // Shown on this stage too, so it is sent from here as well
-      metalRemaining: parseWeightInput(formData.metalRemaining),
+      // Not sent: the figure was set with the castings and is not on this
+      // screen, so the batch keeps what it already holds
       notes: formData.notes,
     });
   };
@@ -1167,10 +1194,29 @@ export default function ProductionPage() {
     }
   };
 
-  const openCreate = () => {
+  /**
+   * Writing up a heat that ran weeks ago.
+   *
+   * Same form, two extra answers: which day it ran and what number it was
+   * given. Both belong to the record - a batch from last month carries last
+   * month's number - so neither can be invented here.
+   */
+  const [backdating, setBackdating] = React.useState(false);
+
+  /**
+   * The prefix numbers for the chosen month start with - "26J" for October
+   * 2026 - so the admin is told the shape before typing rather than after.
+   * Worked out from the same helper the allocator uses, so the two agree.
+   */
+  const expectedBatchPrefix = formData.batchDate
+    ? batchPrefix(new Date(`${formData.batchDate}T00:00:00`))
+    : "";
+
+  const openCreate = (previous = false) => {
     setEditingRecord(null);
     setError("");
     resetForm();
+    setBackdating(previous);
     setBatchModal("create");
   };
 
@@ -1401,6 +1447,16 @@ export default function ProductionPage() {
             <Download className="h-4 w-4 mr-2" />
             Export
           </Button>
+          {/* Catching up on heats that ran before anyone wrote them down.
+              Admin only, because it sets the batch number and the date by
+              hand - the two things the ordinary form will not let anyone
+              choose. */}
+          {isAdmin && (
+            <Button variant="outline" size="sm" onClick={() => openCreate(true)}>
+              <Clock className="h-4 w-4 mr-2" />
+              Add Previous Batch
+            </Button>
+          )}
           <Button onClick={() => openCreate()}>
             <Plus className="h-4 w-4 mr-2" />
             New Production Batch
@@ -1777,10 +1833,16 @@ export default function ProductionPage() {
       <Modal
         isOpen={batchModal !== null}
         onClose={closeBatchModal}
-        title={MODAL_COPY[batchModal ?? "create"].title}
+        title={
+          batchModal === "create" && backdating
+            ? "Add a Previous Batch"
+            : MODAL_COPY[batchModal ?? "create"].title
+        }
         description={
           editingRecord
             ? `${editingRecord.batchNumber} - ${MODAL_COPY[batchModal ?? "create"].description}`
+            : batchModal === "create" && backdating
+            ? "A heat that already ran. Give the day it ran and the number it was given."
             : MODAL_COPY[batchModal ?? "create"].description
         }
         size="xl"
@@ -1983,6 +2045,43 @@ export default function ProductionPage() {
             <h4 className="font-medium text-[var(--foreground)] mb-3">
               Furnace &amp; Input Material
             </h4>
+            {backdating && (
+              <div className="mb-4 rounded-lg border border-[var(--primary)]/30 bg-[var(--accent)] p-3">
+                <p className="mb-3 text-sm font-medium text-[var(--foreground)]">
+                  A batch that already ran
+                </p>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Input
+                    label="Date it ran"
+                    type="date"
+                    max={new Date().toISOString().slice(0, 10)}
+                    value={formData.batchDate}
+                    onChange={(e) =>
+                      setFormData({ ...formData, batchDate: e.target.value })
+                    }
+                    className="h-12"
+                  />
+                  <Input
+                    label="Batch number"
+                    placeholder={expectedBatchPrefix ? `${expectedBatchPrefix}01` : "26I01"}
+                    value={formData.batchNumber}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        batchNumber: e.target.value.toUpperCase(),
+                      })
+                    }
+                    className="h-12"
+                  />
+                </div>
+                <p className="mt-2 text-xs text-[var(--muted-foreground)]">
+                  {expectedBatchPrefix
+                    ? `Numbers for that month start ${expectedBatchPrefix} - for example ${expectedBatchPrefix}01. The system will say if that number is already used.`
+                    : "Pick the date first, then the number for that month."}
+                </p>
+              </div>
+            )}
+
             {/* Who was actually on the furnace. Optional: the login name
                 records who typed the batch in, usually a manager writing up
                 someone else's shift, and losing a whole heat over a missing
@@ -2628,14 +2727,16 @@ export default function ProductionPage() {
             </div>
           </div>
 
-          {/* What is still in the furnace when this batch closes.
-              Its own section, because it is not scrap and not output - it is
-              metal that never left, and the next heat on this furnace can be
-              charged with it. */}
-          {/* On both stages: the castings decide the figure, and closing the
-              batch is the last chance to correct it before the next heat is
-              charged with whatever it says. */}
-          {showOutput && (
+
+          </>
+          )}
+
+          {/* What is still in the furnace.
+              Asked for once, with the castings - those counts are what decide
+              it - and outside the scrap block, which is where it used to sit:
+              nested there, the castings stage skipped it entirely and the
+              figure never appeared on the only screen that sets it. */}
+          {showParts && (
             <div className="rounded-lg border border-amber-300 bg-amber-50 p-4">
               <h4 className="mb-1 flex items-center gap-2 font-medium text-amber-900">
                 <Flame className="h-4 w-4" />
@@ -2693,16 +2794,30 @@ export default function ProductionPage() {
                   </p>
                 )}
               </div>
-              {parseWeightInput(formData.metalRemaining) > 0 && (
+              {/* Said with the figure in it, because this is the number the
+                  next heat gets charged with - and it is claimable as soon as
+                  this is saved, without waiting for the batch to be closed. */}
+              {parseWeightInput(formData.metalRemaining) > 0 ? (
+                <div className="mt-3 flex items-start gap-2 rounded-lg border border-green-300 bg-green-50 p-3">
+                  <PackageCheck className="mt-0.5 h-4 w-4 shrink-0 text-green-700" />
+                  <p className="text-xs text-green-900">
+                    <span className="font-semibold">
+                      {formatWeight(parseWeightInput(formData.metalRemaining))}
+                    </span>{" "}
+                    stays in{" "}
+                    {editingRecord?.furnace?.name ?? "this furnace"} and can be
+                    used by the next batch on it. Pick this batch there under
+                    &quot;Metal still in {editingRecord?.furnace?.name ?? "the furnace"}&quot;.
+                    You do not have to complete this batch first.
+                  </p>
+                </div>
+              ) : (
                 <p className="mt-2 text-xs text-amber-800">
-                  This metal stays in the furnace. The next batch on this
-                  furnace can use it.
+                  Nothing will be left for the next batch - all the metal went
+                  into the parts.
                 </p>
               )}
             </div>
-          )}
-
-          </>
           )}
 
           {/* One note box, in the place a note belongs - the bottom of the
@@ -2742,6 +2857,8 @@ export default function ProductionPage() {
                       ? "The metal charged is deducted from stock now - it is in the furnace. The batch stays In Progress until you add the melt reading and the parts."
                       : isAmending
                       ? "Every stock line moves by the DIFFERENCE between what this batch was recorded as before and what you save now - including a changed grade. Nothing is booked twice."
+                      : batchModal === "parts"
+                      ? "No stock moves yet. The parts are counted and the metal left in the furnace is recorded - the next batch on this furnace can use it straight away. Scrap is weighed when you complete the batch."
                       : "The scrap generated is added to this grade's stock and the batch is closed."}
                   </p>
                 </div>

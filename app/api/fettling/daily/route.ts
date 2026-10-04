@@ -79,6 +79,14 @@ const { searchParams } = new URL(request.url);
         partsRejected: entry?.partsRejected ?? null,
         notes: entry?.notes ?? "",
         activityId: entry?.id ?? null,
+        /**
+         * When the entry was written up.
+         *
+         * The list is built per employee, so without this the only order
+         * available was the employee list's own - and the entry somebody just
+         * saved could land anywhere in it.
+         */
+        recordedAt: entry?.createdAt ?? null,
         recordedBy: entry?.user?.name ?? null,
         // The per-part breakdown, so the list can show what was worked on
         // without a second request per row

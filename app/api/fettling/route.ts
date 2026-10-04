@@ -35,6 +35,13 @@ import { Prisma } from "@prisma/client";
  */
 export class MovementRefused extends Error {}
 
+/**
+ * What the form sends for "all of this part's rejects, whichever bench turned
+ * them down". Expanded into one row per pile before anything is stored, so it
+ * never reaches the database.
+ */
+export const COMBINED_REPAIR = "REWORK:ALL";
+
 export interface NormalisedItem {
   partId: string;
   partsCompleted: number;
@@ -87,14 +94,25 @@ export async function normaliseItems(
   }
 
   const items: NormalisedItem[] = [];
+  /** Rows produced by splitting a combined repair line across its piles. */
+  const expanded: NormalisedItem[] = [];
   const seen = new Set<string>();
 
   for (const line of raw) {
     if (!line?.partId) return { ok: false, error: "Every line needs a part" };
-    if (seen.has(line.partId)) {
+    /*
+     * A part appears once per QUEUE, not once per day.
+     *
+     * A welder repairing a part's rejects from fettling and the same part's
+     * rejects from bending is doing two different jobs on two different piles;
+     * refusing the second meant that day's work could not be written down at
+     * all. The same part on the same queue twice is still ambiguous.
+     */
+    const lineKey = `${line.partId}|${typeof line.source === "string" ? line.source : ""}`;
+    if (seen.has(lineKey)) {
       return { ok: false, error: "The same part is listed more than once" };
     }
-    seen.add(line.partId);
+    seen.add(lineKey);
 
     const done = Number(line.partsCompleted);
     if (!Number.isInteger(done) || done < 0) {
@@ -236,6 +254,20 @@ export async function normaliseItems(
      */
     const isRework = line.source?.startsWith("REWORK:") ?? false;
 
+    /*
+     * "All of this part's rejects", as one line.
+     *
+     * A welder is handed a tray of a part's rejects; which bench turned each
+     * one down is written on the ledger, not on the casting. Asking them to
+     * split their count across piles before they can record a day's work is
+     * bookkeeping pushed onto the shop floor, so they enter one figure and it
+     * is divided below, pile by pile.
+     */
+    if (line.source === COMBINED_REPAIR) {
+      item.reworkFromStepId = COMBINED_REPAIR;
+      continue;
+    }
+
     if (isRework) {
       const fromStepId = line.source!.slice("REWORK:".length);
       const rejectedAt = route.find((s) => s.id === fromStepId);
@@ -286,10 +318,90 @@ export async function normaliseItems(
     item.routeStepId = step.id;
   }
 
+  /*
+   * Divide each combined repair line across the piles it drew from.
+   *
+   * Earliest station first, taking what each pile holds until the count is
+   * used up - the pieces rejected furthest back have waited longest. Pieces
+   * that could not be saved are counted off in the same order.
+   *
+   * One line in becomes one row per pile, which is what the database now
+   * allows and what makes the breakdown readable afterwards: "4 from Riser
+   * Cutting, 3 from Leak Testing" rather than seven pieces from nowhere.
+   */
+  const combined = items.filter((i) => i.reworkFromStepId === COMBINED_REPAIR);
+  if (combined.length > 0) {
+    const piles = await prisma.partStage.findMany({
+      where: {
+        partId: { in: combined.map((i) => i.partId) },
+        kind: "REWORK",
+        quantity: { gt: 0 },
+      },
+      select: { partId: true, routeStepId: true, quantity: true },
+    });
+
+    for (const item of combined) {
+      const route = routes.get(item.partId) ?? [];
+      const code = partCodes.get(item.partId) ?? "That part";
+      const mine = piles
+        .filter((p) => p.partId === item.partId && p.routeStepId)
+        .sort(
+          (a, b) =>
+            (route.find((s) => s.id === a.routeStepId)?.sequence ?? 0) -
+            (route.find((s) => s.id === b.routeStepId)?.sequence ?? 0)
+        );
+
+      const available = mine.reduce((sum, p) => sum + p.quantity, 0);
+      if (item.partsCompleted > available) {
+        return {
+          ok: false,
+          error: `Only ${available} piece${available === 1 ? "" : "s"} of ${code} ${available === 1 ? "is" : "are"} waiting for repair, and this says ${item.partsCompleted}.`,
+        };
+      }
+
+      let toDo = item.partsCompleted;
+      let toScrap = item.partsRejected;
+      let weightLeft = item.rejectedWeight;
+
+      for (const pile of mine) {
+        if (toDo <= 0) break;
+        const take = Math.min(toDo, pile.quantity);
+        const scrapped = Math.min(toScrap, take);
+        toDo -= take;
+        toScrap -= scrapped;
+
+        // The weighed scrap belongs to the pieces actually melted, so it is
+        // carried on whichever rows account for them
+        let weightHere: number | null = null;
+        if (weightLeft !== null && scrapped > 0) {
+          weightHere = toScrap === 0 ? weightLeft : null;
+          if (toScrap === 0) weightLeft = null;
+        }
+
+        expanded.push({
+          partId: item.partId,
+          partsCompleted: take,
+          partsRejected: scrapped,
+          rejectedWeight: weightHere,
+          reworkQty: 0,
+          routeStepId: null,
+          reworkFromStepId: pile.routeStepId,
+          // Saved pieces go back to the station that rejected them - with the
+          // piles combined there is no single answer to ask for
+          returnStepId: pile.routeStepId,
+        });
+      }
+    }
+  }
+
   // `source` and `returnTo` were only ever how the caller named a queue. The
   // resolved step ids are what get stored, so the raw ones are dropped here -
   // passing them through would be handing Prisma columns that do not exist.
-  const stored: NormalisedItem[] = items.map((i) => ({
+  const stored: NormalisedItem[] = [
+    ...expanded,
+    ...items
+    .filter((i) => i.reworkFromStepId !== COMBINED_REPAIR)
+    .map((i) => ({
     partId: i.partId,
     partsCompleted: i.partsCompleted,
     partsRejected: i.partsRejected,
@@ -298,13 +410,14 @@ export async function normaliseItems(
     routeStepId: i.routeStepId,
     reworkFromStepId: i.reworkFromStepId,
     returnStepId: i.returnStepId,
-  }));
+  })),
+  ];
 
   return {
     ok: true,
     items: stored,
-    completed: items.reduce((sum, i) => sum + i.partsCompleted, 0),
-    rejected: items.reduce((sum, i) => sum + i.partsRejected, 0),
+    completed: stored.reduce((sum, i) => sum + i.partsCompleted, 0),
+    rejected: stored.reduce((sum, i) => sum + i.partsRejected, 0),
     routes,
     partCodes,
     parts: new Map(

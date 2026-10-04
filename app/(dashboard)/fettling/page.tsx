@@ -27,6 +27,8 @@ import { Modal, ModalFooter } from "@/components/ui/modal";
 import { StatCard } from "@/components/ui/stat-card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { formatDate } from "@/lib/utils";
+/** The form's way of saying "all of this part's repair piles at once". */
+const COMBINED_REPAIR = "REWORK:ALL";
 import {
   announcePiecesChanged,
   useRefreshOnChange,
@@ -83,6 +85,8 @@ interface DayRow {
   partsRejected: number | null;
   notes: string;
   activityId: string | null;
+  /** When it was written up - newest first in the recorded list. */
+  recordedAt?: string | null;
   recordedBy: string | null;
   items: ActivityItem[];
 }
@@ -100,6 +104,13 @@ interface DaySheet {
 
 /** A part line being edited in the popup, held as strings like every form. */
 interface DraftLine {
+  /**
+   * Identifies this line, because a part is no longer unique in the list.
+   *
+   * Reopening a welder's day shows one line per pile they repaired, and
+   * editing by part id would have changed both at once.
+   */
+  key: string;
   partId: string;
   partsCompleted: string;
   partsRejected: string;
@@ -147,6 +158,8 @@ export default function FettlingPage() {
       stageKey: string;
       quantity: number;
       kind: string;
+      /** When this queue last changed - "waiting since" without a ledger replay. */
+      lastUpdated?: string;
       routeStep: {
         sequence: number;
         activityTypeId: string;
@@ -290,7 +303,18 @@ export default function FettlingPage() {
     (o) => !lines.some((l) => l.partId === o.value)
   );
 
-  const recorded = sheet?.rows.filter((r) => r.activityId) ?? [];
+  /*
+   * Newest entry at the top.
+   *
+   * The sheet is built employee by employee, so a day's entries came out in
+   * staff order - the one just saved could appear anywhere in the list, and
+   * the person who wrote it had to go hunting to check it.
+   */
+  const recorded = [...(sheet?.rows.filter((r) => r.activityId) ?? [])].sort(
+    (a, b) =>
+      new Date(b.recordedAt ?? 0).getTime() -
+      new Date(a.recordedAt ?? 0).getTime()
+  );
   const pending = sheet?.rows.filter((r) => !r.activityId) ?? [];
 
   /** Pieces standing in one queue right now. */
@@ -315,11 +339,71 @@ export default function FettlingPage() {
   /**
    * The queues this employee could be working from, for one part.
    *
-   * Built from the part's ROUTE, not from whichever stations happen to hold
-   * pieces: a station with an empty queue is still a real choice (and the one
-   * an edited entry emptied must stay selectable). Repair piles are offered
-   * when they hold pieces, or when this entry already drew from them.
+   * The process decides which kind of work this is, and the two kinds are
+   * never mixed:
+   *
+   *   on the part's route  -> that station's own queue, and nothing else.
+   *                           Fettling does fettling; it is not offered other
+   *                           benches' reject piles.
+   *   not on the route     -> a repair bench. Only reject piles, never route
+   *                           work, because the part does not pass through
+   *                           this station on its way through the shop.
+   *
+   * Offering both at once was how a fettler ended up looking at welding's
+   * repair piles in a list they had no business choosing from.
    */
+  /**
+   * A part's reject piles, biggest question first: which bench turned them
+   * down, and how many. Route order, because that is the order they are
+   * worked through.
+   */
+  const pilesFor = React.useCallback(
+    (partId: string) =>
+      (parts.find((p) => p.id === partId)?.routeSteps ?? [])
+        .map((step) => ({
+          step,
+          available: availableIn(partId, `REWORK:${step.id}`),
+        }))
+        .filter((pile) => pile.available > 0),
+    [parts, availableIn]
+  );
+
+  /**
+   * A short line about the queue at this station: where the pieces came from
+   * and when they last moved.
+   *
+   * "7 waiting" alone says nothing about whether they arrived this morning or
+   * have been sitting there a fortnight, and the bench before this one is the
+   * first place to ask when a queue is not moving.
+   */
+  const queueNoteFor = React.useCallback(
+    (partId: string, stageKey: string) => {
+      const stage = stages.find(
+        (s) => s.partId === partId && s.stageKey === stageKey
+      );
+      if (!stage || stage.quantity <= 0) return null;
+
+      const route = parts.find((p) => p.id === partId)?.routeSteps ?? [];
+      const here = route.findIndex(
+        (r) => r.sequence === stage.routeStep?.sequence
+      );
+      const cameFrom =
+        here <= 0
+          ? "cast at the furnace"
+          : `${route[here - 1].activityType.name}`;
+
+      const when = stage.lastUpdated
+        ? new Date(stage.lastUpdated).toLocaleDateString("en-IN", {
+            day: "numeric",
+            month: "short",
+          })
+        : null;
+
+      return `From ${cameFrom}${when ? ` - last moved ${when}` : ""}`;
+    },
+    [stages, parts]
+  );
+
   const sourcesFor = React.useCallback(
     (partId: string) => {
       const route = parts.find((p) => p.id === partId)?.routeSteps ?? [];
@@ -327,6 +411,9 @@ export default function FettlingPage() {
 
       const own = route.find((r) => r.activityTypeId === formActivityTypeId);
       if (own) {
+        // A station on the route works its own queue. An empty queue is still
+        // the right answer - and the one an edited entry emptied has to stay
+        // selectable, or that entry could not be reopened.
         const key = `STEP:${own.id}`;
         const available = availableIn(partId, key);
         options.push({
@@ -334,38 +421,55 @@ export default function FettlingPage() {
           label: `${own.activityType.name} queue - ${available} waiting`,
           available,
         });
+        return options;
       }
 
-      for (const step of route) {
-        const key = `REWORK:${step.id}`;
-        const available = availableIn(partId, key);
-        if (available <= 0) continue;
+      /*
+       * A repair bench gets ONE line for the part, not one per pile.
+       *
+       * A welder is handed a tray of rejects; which bench turned each one down
+       * is on the ledger, not on the casting. Splitting the count across piles
+       * before the day could be recorded was bookkeeping pushed onto the shop
+       * floor - and with two piles, one employee could not be given both.
+       * They enter one figure and the server divides it, earliest station
+       * first, so the breakdown still comes out right.
+       */
+      const piles = pilesFor(partId);
+
+      if (piles.length > 0) {
+        const total = piles.reduce((sum, p) => sum + p.available, 0);
         options.push({
-          value: key,
-          label: `Repair - rejected at ${step.activityType.name} (${available})`,
-          available,
+          value: COMBINED_REPAIR,
+          label: `Repair - ${total} waiting (${piles
+            .map((p) => `${p.available} from ${p.step.activityType.name}`)
+            .join(", ")})`,
+          available: total,
         });
       }
 
       return options;
     },
-    [parts, formActivityTypeId, availableIn]
+    [parts, formActivityTypeId, availableIn, pilesFor]
   );
 
   /*
-   * Keep each line pointed at the right queue when the process changes.
+   * Keep each line pointed at a queue the chosen process can actually work.
    *
-   * A line's queue was chosen when the part was added; switching the process
-   * afterwards left route lines drawing from the OLD station. Route lines now
-   * follow the process. Repair lines are left alone - which pile a welder is
-   * working on does not depend on what the process is called.
+   * A line's queue is picked when the part is added. Switching the process
+   * afterwards used to leave route lines drawing from the OLD station, and a
+   * repair line pointed at a reject pile even once the process had become a
+   * station on the route - which that process cannot touch. Anything the new
+   * process does not offer is re-pointed at what it does.
    */
   React.useEffect(() => {
     setLines((current) => {
       let changed = false;
       const next = current.map((line) => {
-        if (line.source.startsWith("REWORK:")) return line;
-        const resolved = sourcesFor(line.partId)[0]?.value ?? "";
+        const options = sourcesFor(line.partId);
+        // A repair line stays put as long as the bench can still work that
+        // pile - which pile a welder is on does not depend on the process name
+        if (options.some((o) => o.value === line.source)) return line;
+        const resolved = options[0]?.value ?? "";
         if (resolved === line.source) return line;
         changed = true;
         return { ...line, source: resolved, returnTo: "" };
@@ -386,6 +490,9 @@ export default function FettlingPage() {
    */
   const returnOptionsFor = React.useCallback(
     (partId: string, source: string) => {
+      // Combined piles: each piece goes back to the bench that rejected it,
+      // so there is no one answer to ask for
+      if (source === COMBINED_REPAIR) return [];
       if (!source.startsWith("REWORK:")) return [];
       const stepId = source.slice("REWORK:".length);
       const part = parts.find((p) => p.id === partId);
@@ -442,6 +549,9 @@ export default function FettlingPage() {
     setFormNotes(row.notes ?? "");
     setLines(
       row.items.map((i) => ({
+        // A repaired part can appear once per pile, so the part id alone no
+        // longer identifies a line
+        key: `${i.partId}|${i.reworkFromStepId ?? i.routeStepId ?? ""}`,
         partId: i.partId,
         partsCompleted: String(i.partsCompleted),
         partsRejected: i.partsRejected ? String(i.partsRejected) : "",
@@ -471,6 +581,7 @@ export default function FettlingPage() {
     setLines((current) => [
       ...current,
       {
+        key: `${partId}|${sourcesFor(partId)[0]?.value ?? "new"}`,
         partId,
         partsCompleted: "",
         partsRejected: "",
@@ -484,9 +595,9 @@ export default function FettlingPage() {
     setPartToAdd("");
   };
 
-  const updateLine = (partId: string, patch: Partial<DraftLine>) => {
+  const updateLine = (key: string, patch: Partial<DraftLine>) => {
     setLines((current) =>
-      current.map((l) => (l.partId === partId ? { ...l, ...patch } : l))
+      current.map((l) => (l.key === key ? { ...l, ...patch } : l))
     );
   };
 
@@ -515,8 +626,8 @@ export default function FettlingPage() {
     });
   }, [lines, manualRework]);
 
-  const removeLine = (partId: string) => {
-    setLines((current) => current.filter((l) => l.partId !== partId));
+  const removeLine = (key: string) => {
+    setLines((current) => current.filter((l) => l.key !== key));
   };
 
   const handleSave = async () => {
@@ -988,7 +1099,7 @@ export default function FettlingPage() {
 
                   return (
                     <div
-                      key={line.partId}
+                      key={line.key}
                       className="rounded-lg border border-[var(--border)] bg-[var(--background)] p-3"
                     >
                       <div className="mb-2 flex items-center justify-between gap-2">
@@ -1011,16 +1122,62 @@ export default function FettlingPage() {
                           >
                             {waiting} waiting
                           </span>
+                          {/* Where this queue came from and when it last
+                              moved. "7 waiting" alone does not say whether
+                              they arrived this morning or have been sitting
+                              a fortnight, and the bench before this one is
+                              the first place to ask when nothing is moving. */}
+                          {!isRepair && queueNoteFor(line.partId, line.source) && (
+                            <span className="ml-2 text-xs text-[var(--muted-foreground)]">
+                              {queueNoteFor(line.partId, line.source)}
+                            </span>
+                          )}
                         </span>
                         <Button
                           variant="ghost"
                           size="icon"
                           title="Remove this part"
-                          onClick={() => removeLine(line.partId)}
+                          onClick={() => removeLine(line.key)}
                         >
                           <X className="h-4 w-4" />
                         </Button>
                       </div>
+
+                      {/* Where the repair pieces came from, as a statement.
+                          The breakdown used to ride on the queue dropdown's
+                          label - and that dropdown is hidden when there is
+                          only one choice, which is every welder's case now the
+                          piles are combined. So "7 waiting" was all they saw,
+                          with no way to know 4 failed at one bench and 3 at
+                          another. Read-only: the split is the ledger's answer,
+                          not something to type over. */}
+                      {isRepair && pilesFor(line.partId).length > 0 && (
+                        <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 p-2.5">
+                          <p className="text-xs font-medium text-amber-900">
+                            These {pilesFor(line.partId).reduce((s, p) => s + p.available, 0)}{" "}
+                            pieces were rejected at:
+                          </p>
+                          <ul className="mt-1 space-y-0.5">
+                            {pilesFor(line.partId).map((pile) => (
+                              <li
+                                key={pile.step.id}
+                                className="flex items-center justify-between text-xs text-amber-800"
+                              >
+                                <span>
+                                  {pile.step.sequence}. {pile.step.activityType.name}
+                                </span>
+                                <span className="font-semibold">
+                                  {pile.available}
+                                </span>
+                              </li>
+                            ))}
+                          </ul>
+                          <p className="mt-1.5 text-xs text-amber-800">
+                            Whatever you save goes back to the bench it failed
+                            at. Oldest station first.
+                          </p>
+                        </div>
+                      )}
 
                       {/* Which queue this work draws from. Repair work comes
                           off another station's reject pile, not this one's
@@ -1035,7 +1192,7 @@ export default function FettlingPage() {
                             }))}
                             value={line.source}
                             onChange={(value) =>
-                              updateLine(line.partId, {
+                              updateLine(line.key, {
                                 source: value,
                                 // The return step belongs to the old queue
                                 returnTo: "",
@@ -1060,7 +1217,7 @@ export default function FettlingPage() {
                           }
                           value={line.partsCompleted}
                           onChange={(e) =>
-                            updateLine(line.partId, {
+                            updateLine(line.key, {
                               partsCompleted: e.target.value,
                             })
                           }
@@ -1073,7 +1230,7 @@ export default function FettlingPage() {
                           error={over ? "Over parts done" : undefined}
                           value={line.partsRejected}
                           onChange={(e) =>
-                            updateLine(line.partId, {
+                            updateLine(line.key, {
                               partsRejected: e.target.value,
                             })
                           }
@@ -1109,7 +1266,7 @@ export default function FettlingPage() {
                               value={line.reworkQty}
                               onChange={(e) => {
                                 setManualRework((m) => new Set(m).add(line.partId));
-                                updateLine(line.partId, { reworkQty: e.target.value });
+                                updateLine(line.key, { reworkQty: e.target.value });
                               }}
                             />
                             {/* Either side can be typed - some benches count
@@ -1129,7 +1286,7 @@ export default function FettlingPage() {
                                 const melt = Number.isFinite(typed)
                                   ? Math.min(Math.max(0, typed), rej)
                                   : 0;
-                                updateLine(line.partId, {
+                                updateLine(line.key, {
                                   reworkQty: String(rej - melt),
                                 });
                               }}
@@ -1157,7 +1314,7 @@ export default function FettlingPage() {
                                 }
                                 value={line.rejectedWeight}
                                 onChange={(e) =>
-                                  updateLine(line.partId, {
+                                  updateLine(line.key, {
                                     rejectedWeight: e.target.value,
                                   })
                                 }
@@ -1165,11 +1322,43 @@ export default function FettlingPage() {
                               {/* No figure is filled in here on purpose: this
                                   weight is added to scrap stock, and a number
                                   nobody weighed would be stock nobody has. */}
-                              {toMelt > 0 && (
-                                <p className="mt-1 text-xs text-amber-700">
-                                  Must be filled in - weigh these pieces.
-                                </p>
-                              )}
+                              {/* One line under the box, about the box. It
+                                  used to sit at the foot of the whole part
+                                  card in a second colour, far from the field
+                                  it described. */}
+                              {/* What these pieces SHOULD weigh - fixed, from
+                                  the count and the part. It used to echo back
+                                  whatever was typed, so a slip of 15 instead
+                                  of 10 just restated itself and there was
+                                  nothing to notice. A real difference is
+                                  allowed - that is why they are weighed - so
+                                  it turns red rather than refusing. */}
+                              {toMelt > 0 && (() => {
+                                const typed = parseWeightInput(line.rejectedWeight);
+                                const off =
+                                  line.rejectedWeight.trim() !== "" &&
+                                  Math.abs(typed - calculated) > 1;
+                                return (
+                                  <p
+                                    className={`mt-1.5 text-sm ${
+                                      off ? "text-[var(--error)]" : "text-amber-700"
+                                    }`}
+                                  >
+                                    Adding {formatWeight(calculated)} of scrap to
+                                    stock &mdash; {toMelt} x{" "}
+                                    {formatWeight(part?.weightPerPiece ?? 0)}.
+                                    {off && (
+                                      <>
+                                        {" "}
+                                        You entered {formatWeight(typed)} -{" "}
+                                        {formatWeight(Math.abs(typed - calculated))}{" "}
+                                        {typed > calculated ? "more" : "less"}.
+                                        Check it.
+                                      </>
+                                    )}
+                                  </p>
+                                );
+                              })()}
                             </div>
                           </div>
                           <p className="mt-1.5 text-xs text-amber-800">
@@ -1182,9 +1371,76 @@ export default function FettlingPage() {
                         </div>
                       )}
 
-                      {/* Where a repaired piece rejoins the line. Never after
-                          the step that rejected it - that check has to be
-                          repeated before the part can ship. */}
+                      {/* A piece that could not be saved at the bench goes to
+                          the melt, and that metal is weighed like any other.
+                          The weight field used to live inside the repair/melt
+                          split above, which a repair line skips entirely - so
+                          the form demanded a weight it never showed. There is
+                          no split to make here: a failed repair has nowhere
+                          left to go. */}
+                      {isRepair && rej > 0 && (
+                        <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3">
+                          <p className="mb-2 text-xs font-medium text-amber-900">
+                            {rej} could not be saved and {rej === 1 ? "goes" : "go"}{" "}
+                            to the melt
+                          </p>
+                          <div className="max-w-xs">
+                            <Input
+                              label={`Weight to melt (${WEIGHT_UNIT})`}
+                              type="number"
+                              min="0"
+                              step="any"
+                              required
+                              placeholder="0"
+                              error={
+                                line.rejectedWeight.trim() === ""
+                                  ? "Enter the weight"
+                                  : undefined
+                              }
+                              value={line.rejectedWeight}
+                              onChange={(e) =>
+                                updateLine(line.key, {
+                                  rejectedWeight: e.target.value,
+                                })
+                              }
+                            />
+                            {/* What they would weigh whole, as a guide only.
+                                Not filled in: a casting that reached the
+                                welding bench has already had metal cut off
+                                it, and a failed repair often has more gone
+                                again - the scale is the only honest answer,
+                                but a figure to sanity-check against stops a
+                                slipped decimal point going into stock. */}
+                            {(() => {
+                              const nominal = rej * (part?.weightPerPiece ?? 0);
+                              const typed = parseWeightInput(line.rejectedWeight);
+                              const off =
+                                line.rejectedWeight.trim() !== "" &&
+                                Math.abs(typed - nominal) > 1;
+                              return (
+                                <p
+                                  className={`mt-1.5 text-sm ${
+                                    off ? "text-[var(--error)]" : "text-amber-700"
+                                  }`}
+                                >
+                                  Adding {formatWeight(nominal)} of scrap to stock
+                                  &mdash; {rej} x{" "}
+                                  {formatWeight(part?.weightPerPiece ?? 0)}.
+                                  {off && (
+                                    <>
+                                      {" "}
+                                      You entered {formatWeight(typed)} -{" "}
+                                      {formatWeight(Math.abs(typed - nominal))}{" "}
+                                      {typed > nominal ? "more" : "less"}. Check it.
+                                    </>
+                                  )}
+                                </p>
+                              );
+                            })()}
+                          </div>
+                        </div>
+                      )}
+
                       {/* Repaired pieces have to be put somewhere, and only
                           the bench knows where a welded casting picks up. */}
                       {isRepair && returnOptions.length > 0 && (
@@ -1203,7 +1459,7 @@ export default function FettlingPage() {
                               line.returnTo || line.source.slice("REWORK:".length)
                             }
                             onChange={(value) =>
-                              updateLine(line.partId, { returnTo: value })
+                              updateLine(line.key, { returnTo: value })
                             }
                           />
                           <p className="mt-1.5 text-xs text-blue-800">
@@ -1214,31 +1470,6 @@ export default function FettlingPage() {
                         </div>
                       )}
 
-                      {toMelt > 0 && (
-                        <p className="mt-2 text-xs text-[var(--muted-foreground)]">
-                          {line.rejectedWeight.trim() === "" ? (
-                            <>
-                              Adding{" "}
-                              <span className="font-medium text-[var(--foreground)]">
-                                {formatWeight(calculated)}
-                              </span>{" "}
-                              of scrap to stock &mdash; {toMelt} x{" "}
-                              {formatWeight(part?.weightPerPiece ?? 0)}.
-                            </>
-                          ) : (
-                            <>
-                              Booking{" "}
-                              <span className="font-medium text-amber-600">
-                                {formatWeight(
-                                  parseWeightInput(line.rejectedWeight)
-                                )}
-                              </span>{" "}
-                              to rejected scrap, as weighed &mdash; the count
-                              works out to {formatWeight(calculated)}.
-                            </>
-                          )}
-                        </p>
-                      )}
                     </div>
                   );
                 })}
