@@ -50,7 +50,8 @@ export async function POST(request: NextRequest) {
     }
 
     const body = await request.json();
-    const { name, contactPerson, phone, email, address, city, state, pincode } = body;
+    const { name, contactPerson, phone, email, address, city, state, pincode, gstNumber, stateCode } =
+      body;
 
     if (!name) {
       return NextResponse.json(
@@ -69,6 +70,10 @@ export async function POST(request: NextRequest) {
         city: city || null,
         state: state || null,
         pincode: pincode || null,
+        // Blank stays null rather than "": a customer whose GSTIN has not been
+        // asked for reads differently from one that genuinely has none
+        gstNumber: gstNumber?.trim() || null,
+        stateCode: stateCode?.trim() || null,
         isActive: true,
       },
     });
@@ -100,7 +105,20 @@ export async function PUT(request: NextRequest) {
     }
 
     const body = await request.json();
-    const { id, name, contactPerson, phone, email, address, city, state, pincode, isActive } = body;
+    const {
+      id,
+      name,
+      contactPerson,
+      phone,
+      email,
+      address,
+      city,
+      state,
+      pincode,
+      gstNumber,
+      stateCode,
+      isActive,
+    } = body;
 
     if (!id) {
       return NextResponse.json({ error: "Company ID is required" }, { status: 400 });
@@ -117,6 +135,8 @@ export async function PUT(request: NextRequest) {
         city,
         state,
         pincode,
+        gstNumber: gstNumber?.trim() || null,
+        stateCode: stateCode?.trim() || null,
         isActive: isActive ?? true,
       },
     });

@@ -19,21 +19,23 @@ enum UserRole {
 
 // User model
 model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  password  String
-  name      String
+  id          String   @id @default(cuid())
+  email       String   @unique
+  password    String
+  name        String
   // Shown on the profile page. Optional - they are contact details, not
   // something a login should depend on.
   phone       String?
   designation String?
-  role      UserRole @default(PRODUCTION_MANAGER)
-  isActive  Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  role        UserRole @default(PRODUCTION_MANAGER)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
   // Relations
   purchaseOrders     PurchaseOrder[]
+  customerOrders     CustomerOrder[]
+  dispatches         Dispatch[]
   productionRecords  ProductionRecord[]
   inventoryLogs      InventoryLog[]
   fettlingActivities FettlingActivity[]
@@ -60,7 +62,11 @@ model Supplier {
   @@map("suppliers")
 }
 
-// Company/Client model
+// A customer - the companies that buy castings from us.
+//
+// Called "Company" in the database because that is what the table has always
+// been; the screens call it a customer, which is what the shop calls it.
+// Their purchase orders hang off it.
 model Company {
   id            String   @id @default(cuid())
   name          String
@@ -71,59 +77,70 @@ model Company {
   city          String?
   state         String?
   pincode       String?
+  /**
+   * GSTIN and the state code it starts with, as printed on their purchase
+   * orders.
+   * Nullable: every customer recorded before POs were tracked has no GSTIN on
+   * file, and a blank says that honestly. They are copied onto an order when
+   * it is raised, so a later correction here cannot rewrite what an old order
+   * was placed against.
+   */
+  gstNumber     String?
+  stateCode     String?
   isActive      Boolean  @default(true)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
   // Relations
-  dispatches Dispatch[]
+  dispatches     Dispatch[]
+  customerOrders CustomerOrder[]
 
   @@map("companies")
 }
 
 // Part model - parts that are manufactured
 model Part {
-  id             String   @id @default(cuid())
-  partCode       String   @unique
-  name           String
-  description    String?
-  /** The finished casting, in grams - what the customer receives. */
-  weightPerPiece Float
+  id                   String   @id @default(cuid())
+  partCode             String   @unique
+  name                 String
+  description          String?
+  /**
+   * The finished casting, in grams - what the customer receives.
+   */
+  weightPerPiece       Float
   /**
    * Metal actually poured for one casting, in grams.
-   *
    * More than the finished part: the gating system - runners, risers, feeders -
    * is poured with it and cut off afterwards. The difference between the two is
    * the expected scrap, so that figure is derived (see expectedScrapOf in
    * lib/parts.ts) rather than stored - nothing can drift out of step with it.
-   *
    * Nullable on purpose: a part recorded before pouring weights were tracked
    * has no honest value here, and null says "not measured yet" where a 0 would
    * claim the mould took exactly the casting's weight.
    */
-  pouringWeight  Float?
+  pouringWeight        Float?
   // The alloy this part is cast in. A casting drawing specifies one, so it
   // lives here rather than being asked for every time - it is what decides
   // which scrap line a rejected casting is booked to.
-  alloyGrade     String   @default("LM6")
+  alloyGrade           String   @default("LM6")
   /**
    * DEPRECATED - the old expected-scrap figure, a PERCENTAGE of the finished
    * weight, typed in by hand.
-   *
    * Superseded by pouringWeight, which gives the same thing in kg without
    * anyone having to work it out. Kept, and still written by nothing, because
    * it is the only record of what each part was set to before the change - it
    * is read by no screen and can be dropped once nobody wants it back. The
    * column keeps its old name in the database so no data has to move.
    */
-  expectedScrapPercent Float @default(0) @map("expectedScrap")
-  isActive       Boolean  @default(true)
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  expectedScrapPercent Float    @default(0) @map("expectedScrap")
+  isActive             Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
 
   // Relations
   productionItems    ProductionItem[]
   dispatches         DispatchItem[]
+  customerOrderItems CustomerOrderItem[]
   fettlingActivities FettlingActivityItem[]
   routeSteps         PartRouteStep[]
   stages             PartStage[]
@@ -152,13 +169,11 @@ model ActivityType {
 
 /**
  * One stop on a part's journey through the shop, in order.
- *
  * A casting is not finished when it comes off the furnace: it is fettled, then
  * decored, then cut, and so on, and the same ten pieces pass through every one
  * of those stations. Recording the route is what lets the system tell "ten
  * pieces moved one step" apart from "twenty pieces exist" - without it, each
  * station's entry looked like new stock.
- *
  * The order matters beyond display: a piece may only be worked at the station
  * holding it, and a piece sent back for rework may return to the step that
  * rejected it or any step BEFORE it - never one after, which would skip the
@@ -168,17 +183,19 @@ model PartRouteStep {
   id             String @id @default(cuid())
   partId         String
   activityTypeId String
-  /** 1-based position in the route. Contiguous, ordered, no gaps. */
+  /**
+   * 1-based position in the route. Contiguous, ordered, no gaps.
+   */
   sequence       Int
 
   createdAt DateTime @default(now())
 
-  part         Part         @relation(fields: [partId], references: [id], onDelete: Cascade)
-  activityType ActivityType @relation(fields: [activityTypeId], references: [id])
-  stages         PartStage[]
-  fettlingItems  FettlingActivityItem[] @relation("ItemRouteStep")
-  reworkItems    FettlingActivityItem[] @relation("ItemReworkFrom")
-  returnedItems  FettlingActivityItem[] @relation("ItemReturnTo")
+  part          Part                   @relation(fields: [partId], references: [id], onDelete: Cascade)
+  activityType  ActivityType           @relation(fields: [activityTypeId], references: [id])
+  stages        PartStage[]
+  fettlingItems FettlingActivityItem[] @relation("ItemRouteStep")
+  reworkItems   FettlingActivityItem[] @relation("ItemReworkFrom")
+  returnedItems FettlingActivityItem[] @relation("ItemReturnTo")
 
   // One part cannot have two steps in the same position...
   @@unique([partId, sequence])
@@ -208,6 +225,9 @@ model Employee {
   activities        FettlingActivity[]
   productionBatches ProductionRecord[]
   activityType      ActivityType       @relation(fields: [activityTypeId], references: [id])
+  // Loads this employee supervised out, and loads they passed on quality
+  dispatchesSupervised Dispatch[] @relation("DispatchSupervisor")
+  dispatchesQcChecked  Dispatch[] @relation("DispatchQcCheck")
 
   @@index([activityTypeId])
   @@map("employees")
@@ -233,9 +253,9 @@ model FettlingActivity {
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
-  employee     Employee     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
-  activityType ActivityType @relation(fields: [activityTypeId], references: [id])
-  user         User         @relation(fields: [recordedBy], references: [id])
+  employee     Employee               @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  activityType ActivityType           @relation(fields: [activityTypeId], references: [id])
+  user         User                   @relation(fields: [recordedBy], references: [id])
   items        FettlingActivityItem[]
 
   // One record per employee per day - the day's work, broken down by part
@@ -254,7 +274,6 @@ model FettlingActivityItem {
   partsRejected  Int    @default(0)
   /**
    * What the rejected castings on this line actually weigh, in grams.
-   *
    * Normally this is the count times the part's weight, and leaving it null
    * says exactly that - use the calculation. It is here because the two are not
    * always the same: a casting can be rejected as a part-filled pour, or broken
@@ -266,7 +285,6 @@ model FettlingActivityItem {
 
   /**
    * The station in the part's route this work belongs to.
-   *
    * Null for two reasons, both meaning "not part of the piece flow": an entry
    * recorded before routing existed, or a part with no route at all. Those
    * entries still count as labour; they simply move no pieces, which is why
@@ -276,7 +294,6 @@ model FettlingActivityItem {
 
   /**
    * How many of the rejected pieces went for repair instead of the melt.
-   *
    * A casting that fails a leak test is not always scrap - a weld can save it,
    * and a foundry that melted every one of them would be pouring good metal
    * back into the furnace for nothing. The rest (partsRejected - reworkQty) go
@@ -287,7 +304,6 @@ model FettlingActivityItem {
 
   /**
    * Set when this entry is repairing pieces rather than working the route.
-   *
    * It names the station whose rework queue is being drained: a welder works
    * on "the ones leak testing rejected", not on a step of the route. Route
    * work has routeStepId set instead; exactly one of the two applies.
@@ -296,7 +312,6 @@ model FettlingActivityItem {
 
   /**
    * Where repaired pieces rejoin the route.
-   *
    * Defaults to the step that rejected them, and may be ANY step of the
    * part's route. A weld can undo work that has to be redone, or leave a
    * casting ready for a later stage - only the bench knows which, so the
@@ -305,19 +320,17 @@ model FettlingActivityItem {
    */
   returnStepId String?
 
-  activity FettlingActivity @relation(fields: [activityId], references: [id], onDelete: Cascade)
-  part     Part             @relation(fields: [partId], references: [id])
-  routeStep PartRouteStep?  @relation("ItemRouteStep", fields: [routeStepId], references: [id])
-  reworkFromStep PartRouteStep? @relation("ItemReworkFrom", fields: [reworkFromStepId], references: [id])
-  returnStep     PartRouteStep? @relation("ItemReturnTo", fields: [returnStepId], references: [id])
+  activity       FettlingActivity @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  part           Part             @relation(fields: [partId], references: [id])
+  routeStep      PartRouteStep?   @relation("ItemRouteStep", fields: [routeStepId], references: [id])
+  reworkFromStep PartRouteStep?   @relation("ItemReworkFrom", fields: [reworkFromStepId], references: [id])
+  returnStep     PartRouteStep?   @relation("ItemReturnTo", fields: [returnStepId], references: [id])
 
-  /*
+  /**
    * Uniqueness lives in the database as two PARTIAL indexes, which Prisma
    * cannot express here (it has no "where" on @@unique):
-   *
-   *   one row per part for ROUTE work          (reworkFromStepId IS NULL)
-   *   one row per part PER PILE for repair     (reworkFromStepId IS NOT NULL)
-   *
+   * one row per part for ROUTE work          (reworkFromStepId IS NULL)
+   * one row per part PER PILE for repair     (reworkFromStepId IS NOT NULL)
    * A welder working a part's rejects from two different stations needs a row
    * for each; a second row for the SAME pile is still refused, which is what
    * stops the same pieces being counted twice. See the migration
@@ -344,7 +357,6 @@ model AppSetting {
 
 /**
  * Where a piece is sitting.
- *
  * WAITING - queued at a station, not yet worked
  * REWORK  - failed at a station and sent for repair rather than to the melt
  * READY   - through the whole route, finished stock
@@ -357,12 +369,10 @@ enum StageKind {
 
 /**
  * How many pieces of one part are at one place in the shop.
- *
  * This is the table that fixes the counting. Before it, ten castings fettled
  * and then decored read as twenty parts, because each station's entry was
  * added up as fresh output. Here a station's entry MOVES pieces from one row
  * to the next, so the same ten stay ten however many hands they pass through.
- *
  * Pieces are conserved: everything cast is waiting somewhere, in rework,
  * finished, or scrapped. Nothing else can happen to it.
  */
@@ -372,7 +382,6 @@ model PartStage {
 
   /**
    * Identifies the place, and is the unique key.
-   *
    * A plain string ("STEP:<id>", "REWORK:<id>", "READY") rather than a pair of
    * columns because READY has no step, and a NULL in a unique index counts as
    * distinct in Postgres - two READY rows for the same part could be created,
@@ -381,9 +390,11 @@ model PartStage {
   stageKey String
 
   kind        StageKind
-  /** The station this row belongs to. Null only for READY. */
+  /**
+   * The station this row belongs to. Null only for READY.
+   */
   routeStepId String?
-  quantity    Int      @default(0)
+  quantity    Int       @default(0)
 
   lastUpdated DateTime @default(now())
 
@@ -399,7 +410,6 @@ model PartStage {
 /**
  * Every movement of pieces between stages, kept for the same reason
  * inventory_logs is: a balance nobody can explain is a balance nobody trusts.
- *
  * Reconcilable the same way - the newest log row for a stage must agree with
  * that stage's quantity.
  */
@@ -408,12 +418,16 @@ model PartStageLog {
   partId   String
   stageKey String
 
-  /** Signed: pieces into this stage, or out of it. */
+  /**
+   * Signed: pieces into this stage, or out of it.
+   */
   quantity    Int
   previousQty Int
   newQty      Int
 
-  /** PRODUCTION, FETTLING, STOCKTAKE or ADJUST. */
+  /**
+   * PRODUCTION, FETTLING, STOCKTAKE or ADJUST.
+   */
   reference   String
   referenceId String?
   notes       String?
@@ -489,10 +503,10 @@ enum POStatus {
 
 // Purchase Order for buying ingots
 model PurchaseOrder {
-  id            String    @id @default(cuid())
-  poNumber      String    @unique
+  id            String       @id @default(cuid())
+  poNumber      String       @unique
   supplierId    String
-  orderDate     DateTime  @default(now())
+  orderDate     DateTime     @default(now())
   expectedDate  DateTime?
   deliveredDate DateTime?
   quantity      Float // Weight in grams
@@ -500,17 +514,165 @@ model PurchaseOrder {
   ingotType     AluminumType @default(INGOT_LM6)
   pricePerKg    Float // Price per kg
   totalAmount   Float // Total amount
-  status        POStatus  @default(PENDING)
+  status        POStatus     @default(PENDING)
   notes         String?
   createdBy     String
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
 
   // Relations
   supplier Supplier @relation(fields: [supplierId], references: [id])
   user     User     @relation(fields: [createdBy], references: [id])
 
   @@map("purchase_orders")
+}
+
+// How much of a customer's order has been supplied.
+//
+// Moved by hand for now: the order is recorded so the office can see what has
+// been promised, and nothing in production reads it yet.
+enum CustomerOrderStatus {
+  OPEN // received, nothing dispatched against it
+  PARTIAL // part-supplied
+  COMPLETED // fully supplied
+  CANCELLED
+}
+
+/**
+ * A purchase order RECEIVED FROM a customer - what they have ordered from us.
+ * Not to be confused with PurchaseOrder, which is the opposite direction: that
+ * is us buying ingot from a supplier. This one is a sales order in all but
+ * name, and keeps the name the paperwork uses so the office recognises it.
+ * The customer's own letterhead details (GSTIN, address, contact) are read off
+ * the Company rather than copied here, except where the order itself carries
+ * them - a delivery address can differ from the registered one.
+ * Money is in rupees, not paise: every figure on these orders is a rupee
+ * amount to two decimals, and the arithmetic (rate x quantity, plus tax) is
+ * the supplier's, not ours - we are recording what they sent us.
+ */
+model CustomerOrder {
+  id        String @id @default(cuid())
+  /**
+   * Their PO number, exactly as printed - e.g. "26001223-A".
+   */
+  poNumber  String
+  companyId String
+
+  poDate        DateTime  @default(now())
+  /**
+   * Their internal reference, printed beside the PO number.
+   */
+  referenceNo   String?
+  referenceDate DateTime?
+
+  /**
+   * Where the castings go, when it is not the registered address.
+   */
+  deliveryAddress String?
+  transporterName String?
+  transport       String?
+  paymentTerms    String?
+
+  status CustomerOrderStatus @default(OPEN)
+
+  /**
+   * Totals in rupees, summed from the lines below.
+   * Stored rather than recomputed on every read for the same reason batch
+   * totals are: they are what the paperwork says, and a rounding rule changed
+   * later must not quietly restate an order that was already accepted.
+   */
+  subTotal   Float @default(0)
+  cgstAmount Float @default(0)
+  sgstAmount Float @default(0)
+  igstAmount Float @default(0)
+  grandTotal Float @default(0)
+
+  specialInstructions String?
+  notes               String?
+
+  createdBy String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company    Company             @relation(fields: [companyId], references: [id])
+  user       User                @relation(fields: [createdBy], references: [id])
+  items      CustomerOrderItem[]
+  dispatches Dispatch[]
+
+  // A PO number is unique to the customer who issued it - two customers can
+  // each have their own "001", and refusing the second would be wrong.
+  @@unique([companyId, poNumber])
+  @@index([companyId])
+  @@index([poDate])
+  @@map("customer_orders")
+}
+
+/**
+ * One line of a customer's order - one row of the table on their PO.
+ * The item is recorded as the customer wrote it (their code, their
+ * description, their HSN) and may ALSO point at one of our parts. The link is
+ * optional on purpose: an order often arrives before the part is set up here,
+ * and refusing to record it until someone creates the part would simply mean
+ * the order never gets entered. The customer's own text stays either way, so
+ * matching it up later changes nothing that was agreed.
+ */
+model CustomerOrderItem {
+  id      String @id @default(cuid())
+  orderId String
+
+  /**
+   * Sr. No. on their PO - 1-based, kept so lines print in their order.
+   */
+  sequence Int
+
+  /**
+   * Our part, when this line has been matched to one.
+   */
+  partId String?
+
+  /**
+   * Their item code and the description printed under it.
+   */
+  itemCode    String
+  description String?
+  hsnCode     String?
+
+  /**
+   * Pieces ordered. Fractional because their PO prints "10.000".
+   */
+  quantity Float
+  unit     String @default("NOS")
+
+  /**
+   * Rate per unit and quantity x rate, both in rupees.
+   */
+  rate   Float @default(0)
+  amount Float @default(0)
+
+  // Tax as printed: a rate and the amount it worked out to. The amount is
+  // stored rather than derived because it is theirs, down to the paisa.
+  cgstRate   Float @default(0)
+  cgstAmount Float @default(0)
+  sgstRate   Float @default(0)
+  sgstAmount Float @default(0)
+  igstRate   Float @default(0)
+  igstAmount Float @default(0)
+
+  /**
+   * The delivery schedule printed below the line, when there is one.
+   */
+  scheduleDate DateTime?
+  scheduleQty  Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  order CustomerOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  part  Part?         @relation(fields: [partId], references: [id])
+
+  @@index([orderId])
+  @@index([partId])
+  @@map("customer_order_items")
 }
 
 // Production/Manufacturing record
@@ -546,11 +708,9 @@ model ProductionRecord {
   furnaceId   String?
   /**
    * The shop-floor employee who ran this heat.
-   *
    * Different from createdBy, which is whoever typed it in - often a manager
    * writing up someone else's shift. "Who was on the furnace" is the question
    * asked when a batch looks wrong, and the login name does not answer it.
-   *
    * Nullable because every batch recorded before this was asked for has no
    * answer, and inventing one would be worse than leaving it blank. New
    * batches must name an operator.
@@ -584,13 +744,11 @@ model ProductionRecord {
 
   /**
    * Metal still molten in the furnace when this batch closed, in grams.
-   *
    * A heat is rarely poured out to the last kilo: 300 kg charged and 150 kg
    * poured into moulds leaves 150 kg sitting in the furnace. That metal has
    * ALREADY been taken out of inventory - it left stock when this batch was
    * charged - so it is not stock and must never be booked as stock. It is
    * simply recorded here, and the next heat on that furnace can claim it.
-   *
    * Null on every batch recorded before this was tracked, which is honest:
    * nobody wrote down what was left, and 0 would claim the furnace was run dry.
    */
@@ -598,18 +756,16 @@ model ProductionRecord {
 
   /**
    * The batch whose leftover metal was melted into this one.
-   *
    * Unique, so a given heel can only ever be claimed once - two batches both
    * carrying the same 150 kg would invent metal out of nothing, and the
    * database refuses it rather than trusting every code path to check.
    */
-  carriedFromId String? @unique
+  carriedFromId String?           @unique
   carriedFrom   ProductionRecord? @relation("FurnaceHeel", fields: [carriedFromId], references: [id])
   carriedTo     ProductionRecord? @relation("FurnaceHeel")
 
   /**
    * How much of that heel came in, in grams.
-   *
    * Counts towards the charge but NOT towards any stock movement: the metal
    * was deducted from inventory when the previous batch was charged, and
    * deducting it again would take the same kilos out of stock twice. Defaults
@@ -653,7 +809,7 @@ model ProductionRecord {
   user     User             @relation(fields: [createdBy], references: [id])
   furnace  Furnace?         @relation(fields: [furnaceId], references: [id])
   operator Employee?        @relation(fields: [operatorId], references: [id])
-  items   ProductionItem[]
+  items    ProductionItem[]
 
   @@map("production_records")
 }
@@ -680,6 +836,14 @@ model ProductionItem {
   @@map("production_items")
 }
 
+/**
+ * Finished castings going OUT to a customer.
+ * This is the end of the piece flow. A casting is poured, worked station by
+ * station, and finally reaches finished stock (the READY stage); a dispatch
+ * is the only thing that takes it out again. So recording one MOVES pieces
+ * out of READY rather than just writing a note - the same rule the rest of
+ * the shop follows, and the reason "what is still here" can be trusted.
+ */
 model Dispatch {
   id             String   @id @default(cuid())
   dispatchNumber String   @unique
@@ -688,28 +852,84 @@ model Dispatch {
   vehicleNumber  String?
   driverName     String?
   notes          String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+
+  /**
+   * The tax invoice this load was billed on, as written on the paperwork that
+   * travelled with it. Nullable: material goes out on a delivery challan
+   * first and is invoiced later, and notes recorded before this field existed
+   * have no answer. Not unique - one invoice can cover several loads, and the
+   * same number can repeat across financial years.
+   */
+  invoiceNumber String?
+
+  /**
+   * The customer order this delivery is against.
+   * Nullable, and not only for old rows: castings do go out against a verbal
+   * call-off or a sample request with no PO behind them, and refusing to
+   * record those would leave stock on the books that has physically left the
+   * yard.
+   */
+  customerOrderId String?
+
+  /**
+   * Who recorded it. Nullable because nothing recorded before this was asked
+   * for has an answer, and naming someone who was not there would be worse
+   * than leaving it blank.
+   */
+  createdBy String?
+
+  /**
+   * The two people answerable for the load: the man who supervised the
+   * loading, and the one who passed the castings on quality before they went.
+   *
+   * Employees, not users - these are shop floor people who do not log in.
+   * Nullable for notes recorded before this was asked for, and the relations
+   * are SetNull rather than Cascade: removing an employee record must never
+   * erase the fact that these castings left the yard.
+   */
+  supervisorId  String?
+  qcCheckedById String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   // Relations
-  company Company        @relation(fields: [companyId], references: [id])
-  items   DispatchItem[]
+  company       Company        @relation(fields: [companyId], references: [id])
+  customerOrder CustomerOrder? @relation(fields: [customerOrderId], references: [id])
+  user          User?          @relation(fields: [createdBy], references: [id])
+  supervisor    Employee?      @relation("DispatchSupervisor", fields: [supervisorId], references: [id], onDelete: SetNull)
+  qcCheckedBy   Employee?      @relation("DispatchQcCheck", fields: [qcCheckedById], references: [id], onDelete: SetNull)
+  items         DispatchItem[]
 
+  @@index([companyId])
+  @@index([dispatchDate])
+  @@index([customerOrderId])
+  @@index([invoiceNumber])
+  @@index([supervisorId])
+  @@index([qcCheckedById])
   @@map("dispatches")
 }
 
-// Dispatch items
+// One part on an outward note: how many pieces went, and what they weigh.
 model DispatchItem {
   id         String @id @default(cuid())
   dispatchId String
   partId     String
   quantity   Int
-  weight     Float // Total weight in grams
+  /**
+   * Total weight in grams, at the part's finished weight per piece.
+   * Stored rather than worked out on every read because it is what went on
+   * the delivery note: if the part's recorded weight is corrected later, the
+   * note that was signed for does not change.
+   */
+  weight     Float
 
   // Relations
   dispatch Dispatch @relation(fields: [dispatchId], references: [id], onDelete: Cascade)
   part     Part     @relation(fields: [partId], references: [id])
 
+  @@index([dispatchId])
+  @@index([partId])
   @@map("dispatch_items")
 }
 

@@ -146,6 +146,12 @@ export default function PartsPage() {
    */
   const [role, setRole] = React.useState<UserRole | null>(null);
   const canManage = role ? canWrite({ role }, "parts") : false;
+  /*
+   * A part code is the name the shop, the customer's PO and every bit of
+   * paper use for this casting, so correcting a typo in one is an admin's
+   * call. Everyone else who may edit a part sees it as a read-only field.
+   */
+  const canEditPartCode = role === "ADMIN";
   const [isDeleteModalOpen, setIsDeleteModalOpen] = React.useState(false);
   const [selectedPart, setSelectedPart] = React.useState<Part | null>(null);
   const [isLoading, setIsLoading] = React.useState(false);
@@ -1300,7 +1306,12 @@ export default function PartsPage() {
               onChange={(e) =>
                 setFormData({ ...formData, partCode: e.target.value })
               }
-              disabled
+              disabled={!canEditPartCode}
+              helperText={
+                canEditPartCode
+                  ? "History stays with the part, so a rename keeps its batches and orders"
+                  : "Only an admin can change a part code"
+              }
               className="h-12"
             />
             <Input

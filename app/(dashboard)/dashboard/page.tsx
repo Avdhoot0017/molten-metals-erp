@@ -22,6 +22,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { formatWeight, formatCurrency, formatDate } from "@/lib/utils";
 import { materialLabel, type IngotSlice } from "@/lib/ingot";
+import { PartDemand } from "@/components/dashboard/part-demand";
 import type { AluminumType } from "@/types";
 
 interface DashboardData {
@@ -418,6 +419,13 @@ export default function DashboardPage() {
             description={`${formatWeight(partTotals.totalScrap)} scrap generated`}
           />
         </div>
+
+        {/*
+          What customers have asked for, set against what the shop has made.
+          Loads on its own and disappears for roles that may not see customer
+          orders, so the rest of the page is unaffected either way.
+        */}
+        <PartDemand />
 
         {/* Per part-number breakdown */}
         <Card>
