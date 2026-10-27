@@ -15,6 +15,9 @@ export type Resource =
   | "production"
   | "parts"
   | "companies"
+  // Orders received FROM customers. Separate from purchaseOrders, which is us
+  // buying ingot - the two are opposite directions and different desks.
+  | "customerOrders"
   | "purchaseOrders"
   | "suppliers"
   | "analytics"
@@ -37,6 +40,7 @@ export const PERMISSIONS: Record<UserRole, Record<Resource, Access>> = {
     production: WRITE,
     parts: WRITE,
     companies: WRITE,
+    customerOrders: WRITE,
     purchaseOrders: WRITE,
     suppliers: WRITE,
     analytics: WRITE,
@@ -55,6 +59,7 @@ export const PERMISSIONS: Record<UserRole, Record<Resource, Access>> = {
     production: WRITE,
     parts: WRITE,
     companies: WRITE,
+    customerOrders: WRITE,
     purchaseOrders: WRITE,
     suppliers: WRITE,
     analytics: WRITE,
@@ -73,6 +78,7 @@ export const PERMISSIONS: Record<UserRole, Record<Resource, Access>> = {
     // The shop floor defines the parts it fettles
     parts: WRITE,
     companies: NONE,
+    customerOrders: NONE,
     purchaseOrders: NONE,
     suppliers: NONE,
     analytics: NONE,
@@ -88,6 +94,7 @@ export const PERMISSIONS: Record<UserRole, Record<Resource, Access>> = {
     production: READ,
     parts: READ,
     companies: READ,
+    customerOrders: READ,
     purchaseOrders: READ,
     suppliers: READ,
     analytics: READ,
@@ -148,6 +155,19 @@ export function canAdjustScrapStock(user: RoleHolder | null | undefined) {
   return user?.role === "ADMIN";
 }
 
+/**
+ * Only an admin may undo an outward note.
+ *
+ * Cancelling a dispatch puts pieces back into finished stock - it says
+ * castings that were recorded as gone are on the shelf after all. That is a
+ * correction to a signed delivery note, not data entry, and it belongs with
+ * whoever answers for the stock figures. Same reasoning as amending a closed
+ * batch.
+ */
+export function canReverseOutward(user: RoleHolder | null | undefined) {
+  return user?.role === "ADMIN";
+}
+
 export function canReassignEmployeeTask(user: RoleHolder | null | undefined) {
   if (!user) return false;
   return canWrite(user, "employees") || user.role === "FETTLING_MANAGER";
@@ -160,6 +180,12 @@ export const ROUTE_RESOURCES: Array<{ prefix: string; resource: Resource }> = [
   { prefix: "/inventory", resource: "inventory" },
   { prefix: "/production", resource: "production" },
   { prefix: "/parts", resource: "parts" },
+  { prefix: "/customer-orders", resource: "customerOrders" },
+  // Outward follows the same access as the orders it delivers against, which
+  // is what puts it in front of Accounts
+  { prefix: "/customer-outward", resource: "customerOrders" },
+  // The customers list is the companies table under the name the shop uses
+  { prefix: "/customers", resource: "companies" },
   { prefix: "/companies", resource: "companies" },
   { prefix: "/purchase-orders", resource: "purchaseOrders" },
   { prefix: "/suppliers", resource: "suppliers" },

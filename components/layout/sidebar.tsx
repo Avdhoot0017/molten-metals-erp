@@ -22,6 +22,8 @@ import {
   ClipboardList,
   Loader2,
   Workflow,
+  Receipt,
+  Truck,
 } from "lucide-react";
 import type { UserRole } from "@/types";
 import { can, type Resource } from "@/lib/permissions";
@@ -47,7 +49,13 @@ const navItems: NavItem[] = [
   // move, so it is behind the same permission
   { label: "Shop Floor", href: "/shop-floor", icon: Workflow, resource: "fettling" },
   // Commercial
-  { label: "Companies", href: "/companies", icon: Building2, resource: "companies" },
+  { label: "Customers", href: "/customers", icon: Building2, resource: "companies" },
+  // Orders received FROM customers. The entry below is the other direction -
+  // us buying ingot from a supplier - and the two sit apart on purpose.
+  { label: "Customer POs", href: "/customer-orders", icon: Receipt, resource: "customerOrders" },
+  // What has gone out to each customer. Same access as the orders it
+  // delivers against, which is what puts it in front of Accounts.
+  { label: "Customer Outward", href: "/customer-outward", icon: Truck, resource: "customerOrders" },
   { label: "Purchase Orders", href: "/purchase-orders", icon: ShoppingCart, resource: "purchaseOrders" },
   { label: "Suppliers", href: "/suppliers", icon: Users, resource: "suppliers" },
   { label: "Analytics", href: "/analytics", icon: BarChart3, resource: "analytics" },

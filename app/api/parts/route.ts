@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 import { GRADE_NAMES } from "@/lib/ingot";
-import { getSession } from "@/lib/auth";
+import { getSession, isAdmin } from "@/lib/auth";
 import { canRead, canWrite } from "@/lib/permissions";
 import { parsePagination, buildPaginationMeta } from "@/lib/pagination";
 import { Prisma } from "@prisma/client";
@@ -401,6 +401,47 @@ export async function PUT(request: NextRequest) {
     }
 
     /*
+     * The part code is how the shop, the customer POs and every piece of
+     * paper name this casting, so renaming it is an admin's decision alone.
+     *
+     * For anyone else the code that came in is ignored and the stored one
+     * kept, rather than refused: the edit form sends the whole part back, so
+     * refusing would block an ordinary name or weight correction. The code is
+     * only touched when it actually differs, and never to one another part
+     * already holds - its history travels with the part's id, not its code,
+     * so a rename keeps every batch, movement and order line attached.
+     */
+    const current = await prisma.part.findUnique({
+      where: { id },
+      select: { partCode: true },
+    });
+    if (!current) {
+      return NextResponse.json({ error: "Part not found" }, { status: 404 });
+    }
+
+    let codeChange: { partCode?: string } = {};
+    const wantedCode = partCode === undefined ? "" : String(partCode).trim();
+    if (wantedCode && wantedCode !== current.partCode) {
+      if (!isAdmin(session)) {
+        return NextResponse.json(
+          { error: "Only an admin can change a part code" },
+          { status: 403 }
+        );
+      }
+      const clash = await prisma.part.findUnique({
+        where: { partCode: wantedCode },
+        select: { id: true },
+      });
+      if (clash && clash.id !== id) {
+        return NextResponse.json(
+          { error: "Part code already exists" },
+          { status: 400 }
+        );
+      }
+      codeChange = { partCode: wantedCode };
+    }
+
+    /*
      * The route is replaced, not patched.
      *
      * Deleting and recreating inside one transaction sidesteps the reordering
@@ -418,7 +459,7 @@ export async function PUT(request: NextRequest) {
       return tx.part.update({
         where: { id },
         data: {
-          partCode,
+          ...codeChange,
           name,
           description,
           ...weights.value,
