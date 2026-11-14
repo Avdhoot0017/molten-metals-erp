@@ -18,6 +18,13 @@ export type Resource =
   // Orders received FROM customers. Separate from purchaseOrders, which is us
   // buying ingot - the two are opposite directions and different desks.
   | "customerOrders"
+  /*
+   * What has gone out to each customer, separate from the orders it delivers
+   * against. The plant needs to see that castings left - it is the other end
+   * of its own finished stock - while the order behind it, with its prices
+   * and tax, is the office's business. One resource could not say that.
+   */
+  | "customerOutward"
   | "purchaseOrders"
   | "suppliers"
   | "analytics"
@@ -41,16 +48,22 @@ export const PERMISSIONS: Record<UserRole, Record<Resource, Access>> = {
     parts: WRITE,
     companies: WRITE,
     customerOrders: WRITE,
+    customerOutward: WRITE,
     purchaseOrders: WRITE,
     suppliers: WRITE,
     analytics: WRITE,
     settings: WRITE,
   },
 
-  // Runs the plant. Full access, the same as ADMIN - the difference between
-  // the two is not what they can reach but what they may undo: correcting a
-  // completed production batch stays with ADMIN, because it moves stock that
-  // has already been booked. See canAmendCompletedBatch below.
+  // Runs the plant: everything to do with melting, fettling and stock, and
+  // the buying side with it. Two things are deliberately not theirs:
+  //  - correcting a completed production batch, which moves stock already
+  //    booked, stays with ADMIN (see canAmendCompletedBatch below);
+  //  - the customer order desk. A customer PO carries prices and tax, and
+  //    what has gone out against it is what the customer is billed on, so
+  //    raising and delivering against orders sits with the office rather
+  //    than with the plant. Customers themselves stay open to them, because
+  //    the record has to exist before anything can be cast.
   PRODUCTION_MANAGER: {
     dashboard: WRITE,
     employees: WRITE,
@@ -59,17 +72,20 @@ export const PERMISSIONS: Record<UserRole, Record<Resource, Access>> = {
     production: WRITE,
     parts: WRITE,
     companies: WRITE,
-    customerOrders: WRITE,
-    purchaseOrders: WRITE,
+    customerOrders: NONE,
+    // Sees what has gone out, without prices. See canSeeOrderMoney.
+    customerOutward: READ,
+    purchaseOrders: READ,
     suppliers: WRITE,
     analytics: WRITE,
-    settings: WRITE,
+    // Settings is the admin's: users, furnaces and the activity list
+    settings: NONE,
   },
 
   // Runs the fettling shop floor. Holds inventory because the shop books
   // scrap in and out as it works.
   FETTLING_MANAGER: {
-    dashboard: READ,
+    dashboard: WRITE,
     // Runs the shop floor, so it hires and manages the people on it.
     employees: WRITE,
     fettling: WRITE,
@@ -77,28 +93,53 @@ export const PERMISSIONS: Record<UserRole, Record<Resource, Access>> = {
     production: WRITE,
     // The shop floor defines the parts it fettles
     parts: WRITE,
-    companies: NONE,
+    /*
+     * Customers may be added by whoever is in front of the screen when a new
+     * one is taken on - it is a name and address, and the shop needs the
+     * record to exist before it can cast for them. Their orders are a
+     * different matter: a PO carries prices and tax, and what has been
+     * delivered against it is what the customer is billed on, so both stay
+     * off the shop floor.
+     */
+    companies: WRITE,
     customerOrders: NONE,
-    purchaseOrders: NONE,
-    suppliers: NONE,
-    analytics: NONE,
+    // Sees what has gone out, without prices. See canSeeOrderMoney.
+    customerOutward: READ,
+    purchaseOrders: READ,
+    suppliers: WRITE,
+    analytics: WRITE,
     settings: NONE,
   },
 
-  // Read-only across operations, but owns users and settings
+  // Read-only across plant operations, but owns the customer desk, the users
+  // and the settings
   ACCOUNTS: {
-    dashboard: READ,
+    dashboard: WRITE,
     employees: READ,
     fettling: READ,
     inventory: READ,
     production: READ,
-    parts: READ,
-    companies: READ,
-    customerOrders: READ,
-    purchaseOrders: READ,
-    suppliers: READ,
-    analytics: READ,
-    settings: WRITE,
+    // Keeps the part master: codes, weights and rates all come off the
+    // customer's paperwork, which is what she works from
+    parts: WRITE,
+    /*
+     * The customer desk is hers: she takes the customer on, raises their PO
+     * off their paperwork, and records what went out against it. That is her
+     * job rather than the shop floor's, so these three are WRITE while
+     * everything to do with melting and fettling stays read-only.
+     *
+     * Undoing an outward note is still ADMIN alone - see canReverseOutward.
+     * Cancelling one puts castings back into finished stock, which is a
+     * correction to a signed delivery note, not data entry.
+     */
+    companies: WRITE,
+    customerOrders: WRITE,
+    customerOutward: WRITE,
+    purchaseOrders: WRITE,
+    suppliers: WRITE,
+    analytics: WRITE,
+    // Users, furnaces and the activity list stay with the admin
+    settings: NONE,
   },
 };
 
@@ -168,6 +209,19 @@ export function canReverseOutward(user: RoleHolder | null | undefined) {
   return user?.role === "ADMIN";
 }
 
+/**
+ * Whether money may be shown to this role.
+ *
+ * The plant can see what went out to a customer but not what it was sold
+ * for, so anything priced - a rate, a line amount, an order total - is drawn
+ * only when this is true. It follows read access to the customer orders
+ * themselves, because that is where the prices are kept, which means one
+ * answer rather than a judgement per screen.
+ */
+export function canSeeOrderMoney(user: RoleHolder | null | undefined) {
+  return canRead(user, "customerOrders");
+}
+
 export function canReassignEmployeeTask(user: RoleHolder | null | undefined) {
   if (!user) return false;
   return canWrite(user, "employees") || user.role === "FETTLING_MANAGER";
@@ -181,9 +235,8 @@ export const ROUTE_RESOURCES: Array<{ prefix: string; resource: Resource }> = [
   { prefix: "/production", resource: "production" },
   { prefix: "/parts", resource: "parts" },
   { prefix: "/customer-orders", resource: "customerOrders" },
-  // Outward follows the same access as the orders it delivers against, which
-  // is what puts it in front of Accounts
-  { prefix: "/customer-outward", resource: "customerOrders" },
+  // Outward has its own access: the plant may read it, prices masked
+  { prefix: "/customer-outward", resource: "customerOutward" },
   // The customers list is the companies table under the name the shop uses
   { prefix: "/customers", resource: "companies" },
   { prefix: "/companies", resource: "companies" },

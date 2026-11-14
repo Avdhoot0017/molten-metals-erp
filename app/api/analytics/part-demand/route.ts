@@ -33,9 +33,14 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // Customer requirements are commercial figures, so this follows access to
-    // customer orders rather than to the dashboard
-    if (!canRead(session, "customerOrders")) {
+    /*
+     * Counted in pieces, never in rupees, so this follows access to the
+     * outward side rather than to the priced orders: the shop floor is who
+     * the figures are about, and telling them what to make next is the point
+     * of the block. A role without even that gets a 403 and the dashboard
+     * simply leaves the block out.
+     */
+    if (!canRead(session, "customerOutward")) {
       return NextResponse.json(
         { error: "You do not have access to this data" },
         { status: 403 }

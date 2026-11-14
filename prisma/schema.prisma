@@ -94,8 +94,40 @@ model Company {
   // Relations
   dispatches     Dispatch[]
   customerOrders CustomerOrder[]
+  /** The parts this customer buys from us. See CustomerPart. */
+  customerParts  CustomerPart[]
 
   @@map("companies")
+}
+
+/**
+ * Which of our parts a customer actually buys.
+ *
+ * A customer orders a handful of parts out of the whole catalogue, so the
+ * list is recorded against them once and then drives the pickers: raising a
+ * PO offers their parts rather than every casting we make, which is shorter
+ * to read and makes the commonest keying mistake impossible.
+ *
+ * Its own table rather than a column on either side, because it is a plain
+ * many-to-many: a part is sold to several customers and a customer buys
+ * several parts. Nothing else hangs off a row here - it is a list, not
+ * history - so a row may be added or removed freely without touching an
+ * order, a dispatch or a piece movement.
+ */
+model CustomerPart {
+  id        String   @id @default(cuid())
+  companyId String
+  partId    String
+  createdAt DateTime @default(now())
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  part    Part    @relation(fields: [partId], references: [id], onDelete: Cascade)
+
+  // One row per pair - adding the same part twice is the same fact
+  @@unique([companyId, partId])
+  @@index([companyId])
+  @@index([partId])
+  @@map("customer_parts")
 }
 
 // Part model - parts that are manufactured
@@ -140,6 +172,8 @@ model Part {
   // Relations
   productionItems    ProductionItem[]
   dispatches         DispatchItem[]
+  /** Customers who buy this part. See CustomerPart. */
+  customerParts      CustomerPart[]
   customerOrderItems CustomerOrderItem[]
   fettlingActivities FettlingActivityItem[]
   routeSteps         PartRouteStep[]

@@ -46,11 +46,13 @@ export async function GET(request: NextRequest) {
     }
 
     /*
-     * Follows access to customer orders, which is what makes this readable by
-     * Accounts: they answer for what has been invoiced and what is still
-     * owed, and that question is this page.
+     * Outward has its own access, wider than the orders behind it. The office
+     * answers for what has been invoiced and what is still owed, and the
+     * plant needs to see that castings left - it is the other end of its own
+     * finished stock. Nothing here is priced (see canSeeOrderMoney), so the
+     * reply is the same for both.
      */
-    if (!canRead(session, "customerOrders")) {
+    if (!canRead(session, "customerOutward")) {
       return NextResponse.json(
         { error: "You do not have access to this data" },
         { status: 403 }
@@ -250,7 +252,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    if (!canWrite(session, "customerOrders")) {
+    if (!canWrite(session, "customerOutward")) {
       return NextResponse.json(
         { error: "You do not have permission to record a dispatch" },
         { status: 403 }

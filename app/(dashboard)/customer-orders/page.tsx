@@ -74,6 +74,8 @@ interface CustomerRef {
   pincode?: string | null;
   gstNumber?: string | null;
   stateCode?: string | null;
+  /** The parts this customer buys, recorded on the Customers page. */
+  parts?: PartRef[];
 }
 
 interface PartRef {
@@ -384,6 +386,21 @@ export default function CustomerOrdersPage() {
       current.map((line) => (line.key === key ? { ...line, ...patch } : line))
     );
   };
+
+  /**
+   * The parts offered on a line: the ones this customer buys.
+   *
+   * A customer with a list recorded gets just that list - shorter to read,
+   * and it rules out matching a line to a casting they have never bought. A
+   * customer with no list recorded yet gets the whole catalogue: every
+   * customer on file before the list existed is in that state, and refusing
+   * to raise their PO until somebody fills a list in would stop the office
+   * working.
+   */
+  const customerParts = React.useMemo(() => {
+    const own = customers.find((c) => c.id === header.companyId)?.parts ?? [];
+    return own.length > 0 ? own : parts;
+  }, [customers, header.companyId, parts]);
 
   /* Choosing one of our parts fills the line in; the text stays editable
      because the customer's wording is what goes on the invoice. */
@@ -1055,10 +1072,27 @@ export default function CustomerOrdersPage() {
                         label="Our part (optional)"
                         options={[
                           { value: "", label: "Not matched yet" },
-                          ...parts.map((p) => ({
+                          ...customerParts.map((p) => ({
                             value: p.id,
                             label: `${p.partCode} - ${p.name}`,
                           })),
+                          /*
+                           * A line already matched to a part that is not on
+                           * this customer's list keeps its option, so editing
+                           * an older order cannot silently unpick it.
+                           */
+                          ...(line.partId &&
+                          !customerParts.some((p) => p.id === line.partId)
+                            ? [
+                                {
+                                  value: line.partId,
+                                  label: `${
+                                    parts.find((p) => p.id === line.partId)
+                                      ?.partCode ?? "Part"
+                                  } - not on their list`,
+                                },
+                              ]
+                            : []),
                         ]}
                         value={line.partId}
                         onChange={(value) => pickPart(line.key, value)}
