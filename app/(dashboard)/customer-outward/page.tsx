@@ -32,7 +32,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { cn, formatDate, formatWeight } from "@/lib/utils";
-import { canWrite, canReverseOutward } from "@/lib/permissions";
+import { canRead, canWrite, canReverseOutward } from "@/lib/permissions";
 import type { UserRole } from "@/types";
 
 /**
@@ -146,7 +146,14 @@ export default function CustomerOutwardPage() {
   const [cancelNote, setCancelNote] = React.useState<OutwardNote | null>(null);
 
   const [role, setRole] = React.useState<UserRole | null>(null);
-  const canManage = role ? canWrite({ role }, "customerOrders") : false;
+  const canManage = role ? canWrite({ role }, "customerOutward") : false;
+  /*
+   * The plant reads this page but has no business on the priced order behind
+   * a note, so the link across to Customer POs is only drawn for whoever may
+   * open it. The same flag governs anything priced on this screen - today
+   * nothing here is, and that is deliberate.
+   */
+  const canSeeOrders = role ? canRead({ role }, "customerOrders") : false;
   const canCancel = role ? canReverseOutward({ role }) : false;
 
   const [isFormOpen, setIsFormOpen] = React.useState(false);
@@ -394,12 +401,14 @@ export default function CustomerOutwardPage() {
             <RefreshCw className="mr-2 h-4 w-4" />
             Refresh
           </Button>
-          <Link href="/customer-orders">
-            <Button variant="outline" size="sm">
-              <Receipt className="mr-2 h-4 w-4" />
-              Customer POs
-            </Button>
-          </Link>
+          {canSeeOrders && (
+            <Link href="/customer-orders">
+              <Button variant="outline" size="sm">
+                <Receipt className="mr-2 h-4 w-4" />
+                Customer POs
+              </Button>
+            </Link>
+          )}
           {canManage && (
             <Button onClick={() => openForm()}>
               <Plus className="mr-2 h-4 w-4" />

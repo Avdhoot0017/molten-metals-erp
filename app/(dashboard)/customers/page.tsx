@@ -5,6 +5,7 @@ import Link from "next/link";
 import {
   Building2,
   Plus,
+  X,
   Search,
   Edit,
   Trash2,
@@ -33,7 +34,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { formatDate } from "@/lib/utils";
-import { canWrite } from "@/lib/permissions";
+import { canRead, canWrite } from "@/lib/permissions";
 import type { UserRole } from "@/types";
 
 /**
@@ -57,6 +58,18 @@ interface Customer {
   stateCode?: string | null;
   isActive: boolean;
   createdAt: string;
+  /**
+   * The parts this customer buys. Empty means nobody has recorded their list
+   * yet, not that they buy nothing - every customer on file before this was
+   * asked for starts out that way.
+   */
+  parts?: PartRef[];
+}
+
+interface PartRef {
+  id: string;
+  partCode: string;
+  name: string;
 }
 
 const EMPTY_FORM = {
@@ -70,6 +83,7 @@ const EMPTY_FORM = {
   city: "",
   state: "",
   pincode: "",
+  partIds: [] as string[],
 };
 
 /**
@@ -87,6 +101,8 @@ function stateCodeFromGstin(gstin: string): string {
 
 export default function CustomersPage() {
   const [customers, setCustomers] = React.useState<Customer[]>([]);
+  /** The whole catalogue, to pick a customer's parts from. */
+  const [parts, setParts] = React.useState<PartRef[]>([]);
   const [orderCounts, setOrderCounts] = React.useState<Record<string, number>>({});
   const [searchQuery, setSearchQuery] = React.useState("");
   const [filterGst, setFilterGst] = React.useState("");
@@ -106,6 +122,9 @@ export default function CustomersPage() {
    */
   const [role, setRole] = React.useState<UserRole | null>(null);
   const canManage = role ? canWrite({ role }, "companies") : false;
+  /* The plant may keep customers but not read their priced orders, so the
+     link across is only drawn for whoever may open it. */
+  const canSeeOrders = role ? canRead({ role }, "customerOrders") : false;
 
   React.useEffect(() => {
     (async () => {
@@ -123,12 +142,19 @@ export default function CustomersPage() {
   const fetchCustomers = React.useCallback(async () => {
     setIsPageLoading(true);
     try {
-      const [customerRes, orderRes] = await Promise.all([
+      const [customerRes, orderRes, partRes] = await Promise.all([
         fetch("/api/companies"),
         fetch("/api/customer-orders"),
+        // Unpaginated, so the whole catalogue comes back for the part picker
+        fetch("/api/parts"),
       ]);
       const customerData = await customerRes.json();
       if (customerData.success) setCustomers(customerData.data);
+
+      if (partRes.ok) {
+        const partData = await partRes.json();
+        if (partData.success) setParts(partData.data ?? []);
+      }
 
       // How many orders each customer has on file. Not every role may read
       // the orders, so a refusal here simply leaves the column blank.
@@ -262,9 +288,14 @@ export default function CustomersPage() {
       city: customer.city || "",
       state: customer.state || "",
       pincode: customer.pincode || "",
+      partIds: (customer.parts ?? []).map((part) => part.id),
     });
     setIsEditModalOpen(true);
   };
+
+  const unchosenParts = parts.filter(
+    (part) => !formData.partIds.includes(part.id)
+  );
 
   /* The same fields on both modals - one form, filled in or blank. */
   const customerForm = (
@@ -367,6 +398,91 @@ export default function CustomersPage() {
           />
         </div>
       </div>
+
+      {/*
+        * What this customer buys from us.
+        *
+        * Recorded here once and then used when their PO is raised, where the
+        * part picker offers only these instead of the whole catalogue. The
+        * list can be changed at any time: it says what they buy, and nothing
+        * hangs off it, so adding or removing a part leaves their existing
+        * orders and deliveries exactly as they are.
+        */}
+      <div className="rounded-lg border border-[var(--border)] p-4">
+        <div className="mb-1 flex items-center justify-between">
+          <h3 className="text-sm font-semibold">Parts this customer buys</h3>
+          <span className="text-xs text-[var(--muted-foreground)]">
+            {formData.partIds.length} chosen
+          </span>
+        </div>
+        <p className="mb-3 text-xs text-[var(--muted-foreground)]">
+          Only these are offered when a PO is raised for them. Changing the
+          list never touches an order already on file.
+        </p>
+
+        <Select
+          label="Add a part"
+          placeholder={
+            unchosenParts.length === 0
+              ? parts.length === 0
+                ? "No parts in the catalogue yet"
+                : "Every part is already on the list"
+              : "Choose a part to add"
+          }
+          options={unchosenParts.map((part) => ({
+            value: part.id,
+            label: `${part.partCode} - ${part.name}`,
+          }))}
+          /* Stays on the placeholder: this picker adds, it does not hold a
+             value - the list below is the value. */
+          value=""
+          onChange={(value) => {
+            if (!value) return;
+            setFormData((current) =>
+              current.partIds.includes(value)
+                ? current
+                : { ...current, partIds: [...current.partIds, value] }
+            );
+          }}
+          className="h-12"
+        />
+
+        {formData.partIds.length === 0 ? (
+          <p className="mt-3 text-sm text-[var(--muted-foreground)]">
+            Nothing chosen yet. A customer with an empty list can still have a
+            PO raised - every part is offered until the list is recorded.
+          </p>
+        ) : (
+          <div className="mt-3 space-y-2">
+            {formData.partIds.map((partId) => {
+              const part = parts.find((p) => p.id === partId);
+              return (
+                <div
+                  key={partId}
+                  className="flex items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--muted)]/30 px-3 py-2"
+                >
+                  <span className="text-sm">
+                    {part ? `${part.partCode} - ${part.name}` : partId}
+                  </span>
+                  <button
+                    type="button"
+                    title="Remove this part"
+                    onClick={() =>
+                      setFormData((current) => ({
+                        ...current,
+                        partIds: current.partIds.filter((id) => id !== partId),
+                      }))
+                    }
+                    className="cursor-pointer rounded p-1 text-[var(--error)] hover:bg-[var(--error-light)]"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
     </div>
   );
 
@@ -396,12 +512,14 @@ export default function CustomersPage() {
             <RefreshCw className="mr-2 h-4 w-4" />
             Refresh
           </Button>
-          <Link href="/customer-orders">
-            <Button variant="outline" size="sm">
-              <Receipt className="mr-2 h-4 w-4" />
-              Customer POs
-            </Button>
-          </Link>
+          {canSeeOrders && (
+            <Link href="/customer-orders">
+              <Button variant="outline" size="sm">
+                <Receipt className="mr-2 h-4 w-4" />
+                Customer POs
+              </Button>
+            </Link>
+          )}
           {canManage && (
             <Button onClick={() => setIsAddModalOpen(true)}>
               <Plus className="mr-2 h-4 w-4" />
@@ -525,6 +643,7 @@ export default function CustomersPage() {
                 <TableRow>
                   <TableHead>Customer</TableHead>
                   <TableHead>Contact</TableHead>
+                  <TableHead className="text-right">Parts</TableHead>
                   <TableHead>GSTIN</TableHead>
                   <TableHead>Location</TableHead>
                   <TableHead className="text-right">Orders</TableHead>
@@ -570,6 +689,25 @@ export default function CustomersPage() {
                           <span className="text-[var(--muted-foreground)]">-</span>
                         )}
                       </div>
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {customer.parts && customer.parts.length > 0 ? (
+                        <span
+                          className="font-medium"
+                          title={customer.parts
+                            .map((part) => part.partCode)
+                            .join(", ")}
+                        >
+                          {customer.parts.length}
+                        </span>
+                      ) : (
+                        <span
+                          className="text-[var(--muted-foreground)]"
+                          title="No part list recorded - every part is offered on their PO"
+                        >
+                          -
+                        </span>
+                      )}
                     </TableCell>
                     <TableCell>
                       {customer.gstNumber ? (
