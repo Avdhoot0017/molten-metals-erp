@@ -185,6 +185,75 @@ export const LM6_RESERVED_KEYS = new Set(
 );
 
 /**
+ * The element limits a heat is measured against.
+ *
+ * An alloy's spec belongs to the alloy, so it is stored on the grade row and
+ * read from there. Until a grade has one entered, the LM6 grid is used: it is
+ * the one this foundry has always worked to, and showing no elements at all
+ * would mean an assay could not be recorded. A grade WITH a spec is measured
+ * against its own - judging an LM25 heat by LM6 limits is how a melt passes
+ * on paper and fails in the casting.
+ */
+export function elementsForSpec(spec: unknown): AlloyElement[] {
+  if (!Array.isArray(spec) || spec.length === 0) return LM6_ELEMENTS;
+  const elements: AlloyElement[] = [];
+  for (const raw of spec) {
+    if (!raw || typeof raw !== "object") continue;
+    const row = raw as Record<string, unknown>;
+    const symbol = String(row.symbol ?? "").trim();
+    if (!symbol) continue;
+    const min = Number(row.min);
+    const max = Number(row.max);
+    const hasMin = Number.isFinite(min);
+    const hasMax = Number.isFinite(max);
+    elements.push({
+      symbol,
+      name: String(row.name ?? symbol),
+      limit:
+        typeof row.limit === "string" && row.limit
+          ? row.limit
+          : hasMin && hasMax
+            ? `${min} - ${max}%`
+            : hasMax
+              ? `${max}% max`
+              : hasMin
+                ? `${min}% min`
+                : "No limit",
+      ...(hasMin ? { min } : {}),
+      ...(hasMax ? { max } : {}),
+      ...(row.isRemainder ? { isRemainder: true as const } : {}),
+    });
+  }
+  return elements.length > 0 ? elements : LM6_ELEMENTS;
+}
+
+/**
+ * Whether one reading sits inside its element's limits.
+ *
+ * "unknown" for an element the spec says nothing about, which is not the same
+ * as being in spec - the assay simply covered something the alloy does not
+ * pin down.
+ */
+export function specStatus(
+  key: string,
+  value: string,
+  elements: AlloyElement[]
+): "in" | "out" | "unknown" {
+  const element = elements.find(
+    (e) =>
+      e.symbol.toLowerCase() === key.toLowerCase() ||
+      e.name.toLowerCase() === key.toLowerCase()
+  );
+  if (!element || element.isRemainder) return "unknown";
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "unknown";
+  if (element.min !== undefined && num < element.min) return "out";
+  if (element.max !== undefined && num > element.max) return "out";
+  if (element.min === undefined && element.max === undefined) return "unknown";
+  return "in";
+}
+
+/**
  * Validates one typed reading. Returns an error for input that is not a
  * sensible percentage, or an advisory message when it is outside the LM6
  * limit. Blank is valid - the assay may not cover every element.

@@ -29,7 +29,8 @@ import { parseWeightInput, weightToInput, WEIGHT_UNIT } from "@/lib/units";
 import { expectedScrapOf } from "@/lib/parts";
 import { RouteEditor, type RouteStepValue } from "@/components/route-editor";
 import { canWrite } from "@/lib/permissions";
-import { ALLOY_GRADES, gradeSpec } from "@/lib/ingot";
+import { gradeDotStyle } from "@/lib/ingot";
+import { useGrades } from "@/lib/use-grades";
 import type { UserRole } from "@/types";
 
 /** One part's standing, as the shop-floor report works it out. */
@@ -152,6 +153,28 @@ export default function PartsPage() {
    * call. Everyone else who may edit a part sees it as a read-only field.
    */
   const canEditPartCode = role === "ADMIN";
+
+  /*
+   * The alloys this foundry runs, from the master in Settings. A part's grade
+   * decides which scrap line its rejects are booked to, so the list has to be
+   * the live one - a grade added this morning can be specified today.
+   */
+  const { grades, active: activeGrades } = useGrades();
+  const alloyDotStyle = React.useCallback(
+    (name: string) => {
+      const index = grades.findIndex((g) => g.name === name);
+      const grade = grades[index];
+      return grade ? gradeDotStyle(grade, index) : undefined;
+    },
+    [grades]
+  );
+  const alloyDescription = React.useCallback(
+    (name: string) => {
+      const description = grades.find((g) => g.name === name)?.description;
+      return description ? `${description}. ` : "";
+    },
+    [grades]
+  );
   const [isDeleteModalOpen, setIsDeleteModalOpen] = React.useState(false);
   const [selectedPart, setSelectedPart] = React.useState<Part | null>(null);
   const [isLoading, setIsLoading] = React.useState(false);
@@ -571,7 +594,7 @@ export default function PartsPage() {
             <Select
               options={[
                 { value: "", label: "Any metal" },
-                ...ALLOY_GRADES.map((g) => ({ value: g.grade, label: g.grade })),
+                ...grades.map((g) => ({ value: g.name, label: g.name })),
               ]}
               value={filterAlloy}
               onChange={(value) => {
@@ -688,7 +711,8 @@ export default function PartsPage() {
                       <td className="whitespace-nowrap px-4 py-3">
                         <span className="inline-flex items-center gap-2 text-sm">
                           <span
-                            className={`h-2 w-2 rounded-full ${gradeSpec(part.alloyGrade).dotClass}`}
+                            className="h-2 w-2 rounded-full"
+                            style={alloyDotStyle(part.alloyGrade)}
                           />
                           {part.alloyGrade}
                         </span>
@@ -1131,14 +1155,14 @@ export default function PartsPage() {
                 Alloy
               </span>
               <div className="inline-flex gap-1 rounded-lg bg-[var(--muted)] p-1">
-                {ALLOY_GRADES.map((g) => {
-                  const active = formData.alloyGrade === g.grade;
+                {activeGrades.map((g, index) => {
+                  const active = formData.alloyGrade === g.name;
                   return (
                     <button
-                      key={g.grade}
+                      key={g.id}
                       type="button"
                       onClick={() =>
-                        setFormData({ ...formData, alloyGrade: g.grade })
+                        setFormData({ ...formData, alloyGrade: g.name })
                       }
                       className={`cursor-pointer rounded-md px-4 py-2 text-sm font-medium transition-colors ${
                         active
@@ -1147,15 +1171,18 @@ export default function PartsPage() {
                       }`}
                     >
                       <span className="flex items-center gap-2">
-                        <span className={`h-2 w-2 rounded-full ${g.dotClass}`} />
-                        {g.grade}
+                        <span
+                          className="h-2 w-2 rounded-full"
+                          style={gradeDotStyle(g, index)}
+                        />
+                        {g.name}
                       </span>
                     </button>
                   );
                 })}
               </div>
               <p className="mt-1.5 text-xs text-[var(--muted-foreground)]">
-                {gradeSpec(formData.alloyGrade).description}. Rejected castings
+                {alloyDescription(formData.alloyGrade)}Rejected castings
                 are booked to this grade&apos;s scrap.
               </p>
             </div>
@@ -1355,14 +1382,14 @@ export default function PartsPage() {
                 Alloy
               </span>
               <div className="inline-flex gap-1 rounded-lg bg-[var(--muted)] p-1">
-                {ALLOY_GRADES.map((g) => {
-                  const active = formData.alloyGrade === g.grade;
+                {activeGrades.map((g, index) => {
+                  const active = formData.alloyGrade === g.name;
                   return (
                     <button
-                      key={g.grade}
+                      key={g.id}
                       type="button"
                       onClick={() =>
-                        setFormData({ ...formData, alloyGrade: g.grade })
+                        setFormData({ ...formData, alloyGrade: g.name })
                       }
                       className={`cursor-pointer rounded-md px-4 py-2 text-sm font-medium transition-colors ${
                         active
@@ -1371,15 +1398,18 @@ export default function PartsPage() {
                       }`}
                     >
                       <span className="flex items-center gap-2">
-                        <span className={`h-2 w-2 rounded-full ${g.dotClass}`} />
-                        {g.grade}
+                        <span
+                          className="h-2 w-2 rounded-full"
+                          style={gradeDotStyle(g, index)}
+                        />
+                        {g.name}
                       </span>
                     </button>
                   );
                 })}
               </div>
               <p className="mt-1.5 text-xs text-[var(--muted-foreground)]">
-                {gradeSpec(formData.alloyGrade).description}. Rejected castings
+                {alloyDescription(formData.alloyGrade)}Rejected castings
                 are booked to this grade&apos;s scrap.
               </p>
             </div>

@@ -94,7 +94,9 @@ model Company {
   // Relations
   dispatches     Dispatch[]
   customerOrders CustomerOrder[]
-  /** The parts this customer buys from us. See CustomerPart. */
+  /**
+   * The parts this customer buys from us. See CustomerPart.
+   */
   customerParts  CustomerPart[]
 
   @@map("companies")
@@ -102,12 +104,10 @@ model Company {
 
 /**
  * Which of our parts a customer actually buys.
- *
  * A customer orders a handful of parts out of the whole catalogue, so the
  * list is recorded against them once and then drives the pickers: raising a
  * PO offers their parts rather than every casting we make, which is shorter
  * to read and makes the commonest keying mistake impossible.
- *
  * Its own table rather than a column on either side, because it is a plain
  * many-to-many: a part is sold to several customers and a customer buys
  * several parts. Nothing else hangs off a row here - it is a list, not
@@ -172,7 +172,9 @@ model Part {
   // Relations
   productionItems    ProductionItem[]
   dispatches         DispatchItem[]
-  /** Customers who buy this part. See CustomerPart. */
+  /**
+   * Customers who buy this part. See CustomerPart.
+   */
   customerParts      CustomerPart[]
   customerOrderItems CustomerOrderItem[]
   fettlingActivities FettlingActivityItem[]
@@ -256,12 +258,12 @@ model Employee {
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
-  activities        FettlingActivity[]
-  productionBatches ProductionRecord[]
-  activityType      ActivityType       @relation(fields: [activityTypeId], references: [id])
+  activities           FettlingActivity[]
+  productionBatches    ProductionRecord[]
+  activityType         ActivityType       @relation(fields: [activityTypeId], references: [id])
   // Loads this employee supervised out, and loads they passed on quality
-  dispatchesSupervised Dispatch[] @relation("DispatchSupervisor")
-  dispatchesQcChecked  Dispatch[] @relation("DispatchQcCheck")
+  dispatchesSupervised Dispatch[]         @relation("DispatchSupervisor")
+  dispatchesQcChecked  Dispatch[]         @relation("DispatchQcCheck")
 
   @@index([activityTypeId])
   @@map("employees")
@@ -481,6 +483,14 @@ model PartStageLog {
 // the heat it came off - a runner cut from an LM6 casting is still LM6 metal,
 // and re-melting it into an LM9 heat would contaminate the alloy. So grade is
 // carried on scrap exactly as it is on ingot, and the two never mix.
+/**
+ * The twelve material names this system started with.
+ *
+ * Nothing uses this any more - stock lines are text, composed from the alloy
+ * master (see lib/ingot.ts). It is kept so the database type it created is
+ * still described by this schema rather than showing up as drift, and as a
+ * record of what the three original grades were called.
+ */
 enum AluminumType {
   INGOT_LM6
   INGOT_LM9
@@ -496,20 +506,101 @@ enum AluminumType {
   REJECTED_PART_LM25
 }
 
+/**
+ * The alloys this foundry runs, as the admin configures them.
+ * Grades were a hardcoded enum of three (LM6, LM9, LM25). They are a table
+ * because a melt's resulting alloy is a shop-floor decision: three grades
+ * charged together come out as a fourth, and that fourth has to exist as a
+ * material in its own right - held in stock as scrap, charged into the next
+ * heat, bought as ingot. Only the shop knows which alloys it runs, so only
+ * the shop can list them.
+ * Rows are deactivated, never deleted, once anything references them: stock
+ * and batch history are keyed to the id, so a grade that disappeared would
+ * take its own history with it. Renaming is safe for the same reason - the
+ * name is a label, the id is the identity.
+ */
+model AlloyGrade {
+  id              String   @id @default(cuid())
+  /**
+   * As the foundry says it: LM6, LM40, A356. Upper case, no separators.
+   */
+  name            String   @unique
+  /**
+   * The alloy spec in words, e.g. "AlSi12 - general casting alloy".
+   */
+  description     String?
+  /**
+   * Hex for the dots and charts. Falls back to a neutral when unset.
+   */
+  colorHex        String?
+  sortOrder       Int      @default(0)
+  isActive        Boolean  @default(true)
+  /**
+   * Whether fresh ingot of this grade is bought in. A grade that only ever
+   * comes out of the furnace still holds scrap stock, but has no business on
+   * a purchase order.
+   */
+  canBePurchased  Boolean  @default(true)
+  /**
+   * Composition limits for the assay, as [{ symbol, name, min, max }].
+   * Null means no spec has been entered, and the assay is then recorded
+   * without being judged - which is honest, rather than measuring every
+   * heat against LM6 whatever it is.
+   */
+  compositionSpec Json?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  inventory     Inventory[]
+  inventoryLogs InventoryLog[]
+  charges       ProductionCharge[]
+  heats         ProductionRecord[] @relation("HeatResult")
+
+  @@index([isActive, sortOrder])
+  @@map("alloy_grades")
+}
+
 // Current inventory levels
 model Inventory {
-  id          String       @id @default(cuid())
-  type        AluminumType @unique
-  quantity    Float        @default(0) // Weight in grams
-  lastUpdated DateTime     @default(now())
+  id   String @id @default(cuid())
+  /**
+   * Legacy key: the composed "FORM_GRADE" name this line was created under.
+   * Was an enum of twelve; now text, holding exactly the same strings. Kept
+   * filled alongside gradeId/form so anything still reading by name keeps
+   * working, and so a line can always be traced back to what it was.
+   */
+  type String @unique
 
+  /**
+   * What this line actually is: one grade in one form. Nullable only because
+   * the backfill cannot invent a grade for a line whose name no longer parses;
+   * every line the app writes carries both.
+   */
+  gradeId String?
+  form    String?
+
+  quantity    Float    @default(0) // Weight in grams
+  lastUpdated DateTime @default(now())
+
+  grade AlloyGrade? @relation(fields: [gradeId], references: [id])
+
+  @@unique([gradeId, form])
+  @@index([gradeId])
   @@map("inventory")
 }
 
 // Inventory transaction log
 model InventoryLog {
-  id          String       @id @default(cuid())
-  type        AluminumType
+  id          String   @id @default(cuid())
+  /**
+   * The composed name, as above. Text, same strings as the old enum.
+   */
+  type        String
+  /**
+   * The same line as a grade and a form. Null on rows written before this.
+   */
+  gradeId     String?
+  form        String?
   action      String // ADD, REMOVE, ADJUST
   quantity    Float // Weight in grams (positive for add, negative for remove)
   previousQty Float // Previous quantity before transaction
@@ -518,11 +609,13 @@ model InventoryLog {
   referenceId String?
   notes       String?
   createdBy   String
-  createdAt   DateTime     @default(now())
+  createdAt   DateTime @default(now())
 
   // Relations
-  user User @relation(fields: [createdBy], references: [id])
+  user  User        @relation(fields: [createdBy], references: [id])
+  grade AlloyGrade? @relation(fields: [gradeId], references: [id])
 
+  @@index([gradeId, form])
   @@map("inventory_logs")
 }
 
@@ -545,7 +638,13 @@ model PurchaseOrder {
   deliveredDate DateTime?
   quantity      Float // Weight in grams
   // The ingot grade ordered. Delivery adds the quantity to this grade's stock.
-  ingotType     AluminumType @default(INGOT_LM6)
+  /**
+   * Which stock line this ingot is bought into, as "INGOT_<grade>".
+   * Text rather than an enum for the same reason as inventory: the grades are
+   * rows the admin maintains, and an order may be placed for an alloy that
+   * did not exist when this code was written.
+   */
+  ingotType     String       @default("INGOT_LM6")
   pricePerKg    Float // Price per kg
   totalAmount   Float // Total amount
   status        POStatus     @default(PENDING)
@@ -755,12 +854,31 @@ model ProductionRecord {
   // Input
   aluminumUsed Float // Total aluminum used in grams, the sum of the grades below
 
-  // The alloy this heat was run on. One grade per batch: it decides which
-  // scrap may be charged back in, and which grade the scrap coming off the
-  // batch is booked to.
-  ingotGrade AluminumType @default(INGOT_LM6)
+  /**
+   * Legacy: the composed "INGOT_<grade>" name of this heat's alloy. Was an
+   * enum, now text holding the same strings, and kept in step with
+   * resultGradeId so every older read path still answers correctly.
+   */
+  ingotGrade String @default("INGOT_LM6")
 
-  // Kept per grade so historic multi-grade batches still read correctly.
+  /**
+   * The alloy that came OUT of this heat, as the operator declared it.
+   * A heat charged with three grades produces a fourth, and which one is a
+   * judgement the melter makes - not a formula this system is entitled to
+   * guess. Everything downstream follows this field: the scrap coming off the
+   * batch is booked to it, the metal left in the furnace is this alloy, and
+   * the next heat charging that heel takes it in as this grade.
+   * Nullable for batches recorded before it was asked for; those carry their
+   * answer in ingotGrade, and the backfill has copied it across.
+   */
+  resultGradeId String?
+
+  /**
+   * Legacy per-grade charge columns, kept filled for the three original
+   * grades so older reports keep reading. The charge itself now lives in
+   * ProductionCharge, one row per material, which is the only shape that can
+   * hold a heat charged with a grade these columns never knew about.
+   */
   aluminumUsedLM6  Float @default(0)
   aluminumUsedLM9  Float @default(0)
   aluminumUsedLM25 Float @default(0)
@@ -840,12 +958,53 @@ model ProductionRecord {
   updatedAt DateTime @updatedAt
 
   // Relations
-  user     User             @relation(fields: [createdBy], references: [id])
-  furnace  Furnace?         @relation(fields: [furnaceId], references: [id])
-  operator Employee?        @relation(fields: [operatorId], references: [id])
-  items    ProductionItem[]
+  user        User               @relation(fields: [createdBy], references: [id])
+  furnace     Furnace?           @relation(fields: [furnaceId], references: [id])
+  operator    Employee?          @relation(fields: [operatorId], references: [id])
+  items       ProductionItem[]
+  charges     ProductionCharge[]
+  resultGrade AlloyGrade?        @relation("HeatResult", fields: [resultGradeId], references: [id])
 
+  @@index([resultGradeId])
   @@map("production_records")
+}
+
+/**
+ * One material charged into one heat: a grade, a form and a weight.
+ * Replaces the fixed six columns on ProductionRecord, which could only
+ * describe three grades of ingot and three forms of scrap of whatever the
+ * batch grade was. A heat may now be charged with any number of grades in
+ * any form - 10 kg of LM1 ingot, 10 kg of LM2, 5 kg of LM3 spillage - and
+ * each line moves its own stock.
+ */
+model ProductionCharge {
+  id                 String @id @default(cuid())
+  productionRecordId String
+  gradeId            String
+  /**
+   * INGOT, RUNNER_RAISER, SPILLAGE or REJECTED_PART.
+   */
+  form               String
+  weight             Float // grams
+
+  /**
+   * True when this line is metal carried over from the previous heat on the
+   * same furnace. It counts towards the charge but moves no stock: it left
+   * inventory when that earlier batch was charged, and taking it out again
+   * would remove the same kilos twice.
+   */
+  fromHeel Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  record ProductionRecord @relation(fields: [productionRecordId], references: [id], onDelete: Cascade)
+  grade  AlloyGrade       @relation(fields: [gradeId], references: [id])
+
+  // One line per grade-and-form on a batch; a heel line is its own thing
+  @@unique([productionRecordId, gradeId, form, fromHeel])
+  @@index([productionRecordId])
+  @@index([gradeId])
+  @@map("production_charges")
 }
 
 // Dispatch to clients
@@ -916,10 +1075,18 @@ model Dispatch {
    * The two people answerable for the load: the man who supervised the
    * loading, and the one who passed the castings on quality before they went.
    *
-   * Employees, not users - these are shop floor people who do not log in.
-   * Nullable for notes recorded before this was asked for, and the relations
-   * are SetNull rather than Cascade: removing an employee record must never
-   * erase the fact that these castings left the yard.
+   * Written as names rather than picked from the employee list. The person who
+   * loads a lorry is often not on the payroll list - a driver, a contractor,
+   * somebody covering a shift - and a note that could not be saved because the
+   * name was not in a dropdown would simply not be written at all.
+   */
+  supervisorName  String?
+  qcCheckedByName String?
+
+  /**
+   * The same two, as recorded while they were picked from the employee list.
+   * Kept, and still read when the names above are blank, so notes written
+   * then still say who stood behind the load. New notes fill only the names.
    */
   supervisorId  String?
   qcCheckedById String?

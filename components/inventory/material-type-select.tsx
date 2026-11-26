@@ -4,10 +4,11 @@ import * as React from "react";
 import { Package, Recycle, Check } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
-  ALLOY_GRADES,
   MATERIAL_FORMS,
+  gradeDotStyle,
   materialType,
   parseMaterialType,
+  type GradeRef,
 } from "@/lib/ingot";
 import type { AluminumType } from "@/types";
 
@@ -15,6 +16,12 @@ interface MaterialTypeSelectProps {
   value: AluminumType;
   onChange: (type: AluminumType) => void;
   label?: string;
+  /**
+   * The alloys to offer, from the master. Passed in rather than imported:
+   * the list is a table the admin maintains, so only the page that has
+   * fetched it knows what exists.
+   */
+  grades: GradeRef[];
   /**
    * Whether the scrap forms may be chosen. Scrap normally moves through
    * production, so booking it by hand is an admin correction - the options
@@ -36,6 +43,7 @@ export function MaterialTypeSelect({
   value,
   onChange,
   label = "Material Type",
+  grades,
   canChooseScrap = true,
 }: MaterialTypeSelectProps) {
   const { form: selectedForm, grade: selectedGrade } = parseMaterialType(value);
@@ -56,15 +64,15 @@ export function MaterialTypeSelect({
           aria-label="Alloy grade"
           className="inline-flex gap-1 rounded-lg bg-[var(--muted)] p-1"
         >
-          {ALLOY_GRADES.map((g) => {
-            const active = selectedGrade === g.grade;
+          {grades.map((g, index) => {
+            const active = selectedGrade === g.name;
             return (
               <button
-                key={g.grade}
+                key={g.id}
                 type="button"
                 role="tab"
                 aria-selected={active}
-                onClick={() => onChange(materialType(selectedForm, g.grade))}
+                onClick={() => onChange(materialType(selectedForm, g.name))}
                 className={cn(
                   "cursor-pointer rounded-md px-4 py-2 text-sm font-medium transition-colors",
                   active
@@ -73,15 +81,18 @@ export function MaterialTypeSelect({
                 )}
               >
                 <span className="flex items-center gap-2">
-                  <span className={cn("h-2 w-2 rounded-full", g.dotClass)} />
-                  {g.grade}
+                  <span
+                    className="h-2 w-2 rounded-full"
+                    style={gradeDotStyle(g, index)}
+                  />
+                  {g.name}
                 </span>
               </button>
             );
           })}
         </div>
         <p className="mt-2 text-xs text-[var(--muted-foreground)]">
-          {ALLOY_GRADES.find((g) => g.grade === selectedGrade)?.description}
+          {grades.find((g) => g.name === selectedGrade)?.description}
         </p>
       </div>
 

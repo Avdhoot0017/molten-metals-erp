@@ -74,13 +74,6 @@ interface CustomerRow {
   lastDispatchDate: string | null;
 }
 
-/** A shop floor person named on a note - they do not log in, so not a user. */
-interface EmployeeRef {
-  id: string;
-  employeeCode: string;
-  name: string;
-}
-
 interface OutwardNote {
   id: string;
   dispatchNumber: string;
@@ -90,8 +83,13 @@ interface OutwardNote {
   vehicleNumber: string | null;
   driverName: string | null;
   invoiceNumber: string | null;
-  supervisor: EmployeeRef | null;
-  qcCheckedBy: EmployeeRef | null;
+  /**
+   * Who stood behind the load, as typed. A note recorded while these were
+   * picked from the employee list answers with that employee's name, so this
+   * is one string whichever era it came from.
+   */
+  supervisorName: string | null;
+  qcCheckedByName: string | null;
   notes: string | null;
   recordedBy: string | null;
   items: Array<{
@@ -131,7 +129,6 @@ function nos(value: number): string {
 
 export default function CustomerOutwardPage() {
   const [data, setData] = React.useState<OutwardData | null>(null);
-  const [employees, setEmployees] = React.useState<EmployeeRef[]>([]);
   const [orders, setOrders] = React.useState<
     Array<{ id: string; poNumber: string; companyId: string }>
   >([]);
@@ -162,8 +159,8 @@ export default function CustomerOutwardPage() {
     customerOrderId: "",
     dispatchDate: new Date().toISOString().slice(0, 10),
     invoiceNumber: "",
-    supervisorId: "",
-    qcCheckedById: "",
+    supervisorName: "",
+    qcCheckedByName: "",
     vehicleNumber: "",
     driverName: "",
     notes: "",
@@ -185,24 +182,19 @@ export default function CustomerOutwardPage() {
   const fetchAll = React.useCallback(async () => {
     setIsPageLoading(true);
     try {
-      // The part catalogue is not read here any more: the outward form only
-      // offers what the chosen customer has on order, and that comes back
-      // with the outward data itself.
-      const [outwardRes, orderRes, employeeRes] = await Promise.all([
+      /*
+       * Neither the part catalogue nor the employee list is read here any
+       * more: the form offers only what the chosen customer has on order, and
+       * the two names on a note are typed rather than picked.
+       */
+      const [outwardRes, orderRes] = await Promise.all([
         fetch("/api/customer-outward"),
         fetch("/api/customer-orders"),
-        // Active employees only - the two names on a note are people who are
-        // still on the books
-        fetch("/api/employees"),
       ]);
 
       const outwardData = await outwardRes.json();
       if (outwardData.success) setData(outwardData.data);
 
-      if (employeeRes.ok) {
-        const employeeData = await employeeRes.json();
-        if (employeeData.success) setEmployees(employeeData.data ?? []);
-      }
       if (orderRes.ok) {
         const orderData = await orderRes.json();
         if (orderData.success) {
@@ -252,8 +244,8 @@ export default function CustomerOutwardPage() {
       customerOrderId: "",
       dispatchDate: new Date().toISOString().slice(0, 10),
       invoiceNumber: "",
-      supervisorId: "",
-      qcCheckedById: "",
+      supervisorName: "",
+      qcCheckedByName: "",
       vehicleNumber: "",
       driverName: "",
       notes: "",
@@ -368,8 +360,8 @@ export default function CustomerOutwardPage() {
       !query ||
       note.dispatchNumber.toLowerCase().includes(query) ||
       note.invoiceNumber?.toLowerCase().includes(query) ||
-      note.supervisor?.name.toLowerCase().includes(query) ||
-      note.qcCheckedBy?.name.toLowerCase().includes(query) ||
+      note.supervisorName?.toLowerCase().includes(query) ||
+      note.qcCheckedByName?.toLowerCase().includes(query) ||
       note.company.name.toLowerCase().includes(query) ||
       note.items.some((item) => item.partCode.toLowerCase().includes(query))
   );
@@ -642,14 +634,14 @@ export default function CustomerOutwardPage() {
                           * wide, and this is what someone scans for when a
                           * customer rings about a load.
                           */}
-                        {(note.supervisor || note.qcCheckedBy) && (
+                        {(note.supervisorName || note.qcCheckedByName) && (
                           <p className="text-xs text-[var(--muted-foreground)]">
-                            {note.supervisor
-                              ? `Sup ${note.supervisor.name}`
+                            {note.supervisorName
+                              ? `Sup ${note.supervisorName}`
                               : "Sup -"}
                             {" · "}
-                            {note.qcCheckedBy
-                              ? `QC ${note.qcCheckedBy.name}`
+                            {note.qcCheckedByName
+                              ? `QC ${note.qcCheckedByName}`
                               : "QC -"}
                           </p>
                         )}
@@ -940,47 +932,38 @@ export default function CustomerOutwardPage() {
             * stood over the loading, and who passed the castings on quality.
             * Employees, not users - neither of them logs in.
             *
-            * Left optional on purpose. A load that has physically left has to
-            * be recordable even when the clerk does not yet know who checked
-            * it, otherwise the honest outcome is that nobody records it at all
-            * and finished stock stays wrong.
+            * Typed, not picked from the employee list: the man loading a lorry
+            * is often not on it - a driver, a contractor, somebody covering a
+            * shift - and a note that could not be saved for want of a name in
+            * a dropdown would simply not be written.
+            *
+            * Optional for the same reason. A load that has physically left has
+            * to be recordable even when the clerk does not yet know who
+            * checked it, or nobody records it at all and finished stock stays
+            * wrong.
             */}
           <div className="rounded-lg border border-[var(--border)] p-4">
             <h3 className="mb-3 text-sm font-semibold">Signed off by</h3>
             <div className="grid gap-4 md:grid-cols-2">
-              <Select
-                label="Dispatch supervisor"
-                options={[
-                  { value: "", label: "Not recorded" },
-                  ...employees.map((e) => ({
-                    value: e.id,
-                    label: `${e.employeeCode} - ${e.name}`,
-                  })),
-                ]}
-                value={form.supervisorId}
-                onChange={(value) => setForm({ ...form, supervisorId: value })}
+              <Input
+                label="Dispatch supervisor name (optional)"
+                placeholder="Who stood over the loading"
+                value={form.supervisorName}
+                onChange={(e) =>
+                  setForm({ ...form, supervisorName: e.target.value })
+                }
                 className="h-12"
               />
-              <Select
-                label="QC - quality checked by"
-                options={[
-                  { value: "", label: "Not recorded" },
-                  ...employees.map((e) => ({
-                    value: e.id,
-                    label: `${e.employeeCode} - ${e.name}`,
-                  })),
-                ]}
-                value={form.qcCheckedById}
-                onChange={(value) => setForm({ ...form, qcCheckedById: value })}
+              <Input
+                label="QC - quality checked by name (optional)"
+                placeholder="Who passed the castings"
+                value={form.qcCheckedByName}
+                onChange={(e) =>
+                  setForm({ ...form, qcCheckedByName: e.target.value })
+                }
                 className="h-12"
               />
             </div>
-            {employees.length === 0 && (
-              <p className="mt-2 text-xs text-[var(--muted-foreground)]">
-                No active employees on the list yet - add them under Employees
-                and they will appear here.
-              </p>
-            )}
           </div>
 
           <div className="rounded-lg border border-[var(--border)] p-4">
@@ -1135,17 +1118,9 @@ export default function CustomerOutwardPage() {
               <dt className="text-[var(--muted-foreground)]">Invoice</dt>
               <dd>{viewNote.invoiceNumber || "-"}</dd>
               <dt className="text-[var(--muted-foreground)]">Supervisor</dt>
-              <dd>
-                {viewNote.supervisor
-                  ? `${viewNote.supervisor.name} (${viewNote.supervisor.employeeCode})`
-                  : "-"}
-              </dd>
+              <dd>{viewNote.supervisorName || "-"}</dd>
               <dt className="text-[var(--muted-foreground)]">QC checked by</dt>
-              <dd>
-                {viewNote.qcCheckedBy
-                  ? `${viewNote.qcCheckedBy.name} (${viewNote.qcCheckedBy.employeeCode})`
-                  : "-"}
-              </dd>
+              <dd>{viewNote.qcCheckedByName || "-"}</dd>
               <dt className="text-[var(--muted-foreground)]">Vehicle</dt>
               <dd>{viewNote.vehicleNumber || "-"}</dd>
               <dt className="text-[var(--muted-foreground)]">Driver</dt>

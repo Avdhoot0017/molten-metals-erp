@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
-import { GRADE_NAMES } from "@/lib/ingot";
+import { activeGrades } from "@/lib/grades";
 import { getSession, isAdmin } from "@/lib/auth";
 import { canRead, canWrite } from "@/lib/permissions";
 import { parsePagination, buildPaginationMeta } from "@/lib/pagination";
@@ -290,11 +290,19 @@ export async function POST(request: NextRequest) {
 
     // The alloy decides which scrap line a rejected casting is booked to, so
     // an unknown one would quietly send metal to the wrong place
-    if (alloyGrade !== undefined && !GRADE_NAMES.includes(String(alloyGrade))) {
-      return NextResponse.json(
-        { error: `Alloy must be one of ${GRADE_NAMES.join(", ")}` },
-        { status: 400 }
-      );
+    /*
+     * The alloy has to be one the foundry actually runs. Read from the master
+     * rather than a constant, so a grade added in Settings can be specified
+     * on a part the same day.
+     */
+    if (alloyGrade !== undefined) {
+      const names = (await activeGrades()).map((g) => g.name);
+      if (!names.includes(String(alloyGrade))) {
+        return NextResponse.json(
+          { error: `Alloy must be one of ${names.join(", ")}` },
+          { status: 400 }
+        );
+      }
     }
 
     if (!partCode || !name || !weightPerPiece) {
@@ -383,11 +391,19 @@ export async function PUT(request: NextRequest) {
 
     // Same check as on create - an unknown alloy would send a rejected
     // casting's metal to a stock line that does not exist
-    if (alloyGrade !== undefined && !GRADE_NAMES.includes(String(alloyGrade))) {
-      return NextResponse.json(
-        { error: `Alloy must be one of ${GRADE_NAMES.join(", ")}` },
-        { status: 400 }
-      );
+    /*
+     * The alloy has to be one the foundry actually runs. Read from the master
+     * rather than a constant, so a grade added in Settings can be specified
+     * on a part the same day.
+     */
+    if (alloyGrade !== undefined) {
+      const names = (await activeGrades()).map((g) => g.name);
+      if (!names.includes(String(alloyGrade))) {
+        return NextResponse.json(
+          { error: `Alloy must be one of ${names.join(", ")}` },
+          { status: 400 }
+        );
+      }
     }
 
     const weights = castingWeights(weightPerPiece, pouringWeight);

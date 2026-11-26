@@ -19,11 +19,12 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Modal, ModalFooter } from "@/components/ui/modal";
 import { formatWeight, formatDateTime } from "@/lib/utils";
+import { useGrades } from "@/lib/use-grades";
 import {
-  ALLOY_GRADES,
-  ALL_MATERIAL_TYPES,
   MATERIAL_FORMS,
-  gradeSpec,
+  materialTypesFor,
+  gradeDotStyle,
+  gradeTintStyle,
   isScrapType,
   materialLabel,
   materialType,
@@ -95,6 +96,20 @@ function typeMeta(type: AluminumType): {
 
 export default function InventoryPage() {
   const [inventory, setInventory] = React.useState<InventoryItem[]>([]);
+  /*
+   * The alloys this foundry runs. Read from the master rather than a constant:
+   * a grade the admin adds in Settings gets its four stock lines, and they
+   * have to appear here the moment it exists.
+   */
+  const { grades, active: activeGrades } = useGrades();
+  const gradeStyleFor = React.useCallback(
+    (name: string) => {
+      const index = grades.findIndex((g) => g.name === name);
+      const grade = grades[index];
+      return grade ? gradeDotStyle(grade, index) : undefined;
+    },
+    [grades]
+  );
   /**
    * Booking scrap by hand is an admin correction, so the scrap options are
    * disabled for everyone else. Read from the matrix rather than a role list,
@@ -129,7 +144,7 @@ export default function InventoryPage() {
 
       if (result.success) {
         // Transform inventory data for display
-        const inventoryItems: InventoryItem[] = ALL_MATERIAL_TYPES.map((type) => {
+        const inventoryItems: InventoryItem[] = materialTypesFor(grades).map((type) => {
           const item = result.data.inventory.find((inv: InventoryData) => inv.type === type);
           const config = typeMeta(type);
           return {
@@ -154,7 +169,7 @@ export default function InventoryPage() {
     } finally {
       setIsPageLoading(false);
     }
-  }, [logPage, logPageSize]);
+  }, [logPage, logPageSize, grades]);
 
   React.useEffect(() => {
     void (async () => {
@@ -182,7 +197,7 @@ export default function InventoryPage() {
     .map((item) => ({
       ...item,
       // Bars share the grade's colour so the scrap split reads as one alloy
-      barClass: gradeSpec(parseMaterialType(item.type).grade).dotClass,
+      barStyle: gradeStyleFor(parseMaterialType(item.type).grade),
     }));
   const totalScrap = scrapBreakdown.reduce((sum, item) => sum + item.quantity, 0);
 
@@ -194,9 +209,9 @@ export default function InventoryPage() {
    * the sections and the forms line up in the same order inside each, which
    * makes the columns comparable straight down the page.
    */
-  const byGrade = ALLOY_GRADES.map((grade) => {
+  const byGrade = grades.map((grade, gradeIndex) => {
     const items = MATERIAL_FORMS.map((form) => {
-      const type = materialType(form.form, grade.grade);
+      const type = materialType(form.form, grade.name);
       const item = inventory.find((i) => i.type === type);
       return {
         type,
@@ -207,6 +222,7 @@ export default function InventoryPage() {
     const total = items.reduce((sum, i) => sum + i.quantity, 0);
     return {
       ...grade,
+      gradeIndex,
       items,
       total,
       ingot: items.find((i) => i.form.form === "INGOT")?.quantity ?? 0,
@@ -430,13 +446,16 @@ export default function InventoryPage() {
           order inside each, so the columns line up down the page. */}
       <div className="space-y-5">
         {byGrade.map((grade) => (
-          <div key={grade.grade}>
+          <div key={grade.id}>
             {/* Section header: which alloy, and what it holds in total */}
             <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center gap-2.5">
-                <span className={`h-3 w-3 rounded-full ${grade.dotClass}`} />
+                <span
+                  className="h-3 w-3 rounded-full"
+                  style={gradeDotStyle(grade, grade.gradeIndex)}
+                />
                 <h3 className="text-base font-semibold text-[var(--foreground)]">
-                  {grade.grade}
+                  {grade.name}
                 </h3>
                 <span className="text-sm text-[var(--muted-foreground)]">
                   {grade.description}
@@ -474,11 +493,12 @@ export default function InventoryPage() {
                     <CardContent className="flex h-full flex-col p-5">
                       <div className="flex items-start justify-between">
                         <div
-                          className={`rounded-lg p-2.5 ${
+                          className="rounded-lg p-2.5"
+                          style={
                             item.form.isScrap
-                              ? "bg-[var(--muted)]"
-                              : gradeSpec(grade.grade).iconClass
-                          }`}
+                              ? undefined
+                              : gradeTintStyle(grade, grade.gradeIndex)
+                          }
                         >
                           <Icon
                             className={`h-5 w-5 ${
@@ -505,8 +525,11 @@ export default function InventoryPage() {
                       <div className="mt-auto pt-4">
                         <div className="h-1.5 overflow-hidden rounded-full bg-[var(--muted)]">
                           <div
-                            className={`h-full rounded-full ${grade.dotClass} transition-all duration-500`}
-                            style={{ width: `${share}%` }}
+                            className="h-full rounded-full transition-all duration-500"
+                            style={{
+                              ...gradeDotStyle(grade, grade.gradeIndex),
+                              width: `${share}%`,
+                            }}
                           />
                         </div>
                       </div>
@@ -545,8 +568,9 @@ export default function InventoryPage() {
             {scrapBreakdown.map((item) => (
               <div
                 key={item.type}
-                className={`${item.barClass} transition-all duration-500`}
+                className="transition-all duration-500"
                 style={{
+                  ...item.barStyle,
                   width:
                     totalScrap > 0 ? `${(item.quantity / totalScrap) * 100}%` : "0%",
                 }}
@@ -560,13 +584,16 @@ export default function InventoryPage() {
           <div className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-3">
             {byGrade.map((grade) => (
               <div
-                key={grade.grade}
+                key={grade.id}
                 className="rounded-lg border border-[var(--border)] p-3"
               >
                 <div className="flex items-center justify-between gap-2 border-b border-[var(--border)] pb-2">
                   <span className="flex items-center gap-2">
-                    <span className={`h-2.5 w-2.5 rounded-full ${grade.dotClass}`} />
-                    <span className="text-sm font-medium">{grade.grade}</span>
+                    <span
+                      className="h-2.5 w-2.5 rounded-full"
+                      style={gradeDotStyle(grade, grade.gradeIndex)}
+                    />
+                    <span className="text-sm font-medium">{grade.name}</span>
                   </span>
                   <span className="text-sm font-semibold">
                     {formatWeight(grade.scrap)}
@@ -714,6 +741,7 @@ export default function InventoryPage() {
             </div>
           )}
           <MaterialTypeSelect
+            grades={activeGrades}
             value={selectedType}
             onChange={setSelectedType}
             canChooseScrap={canScrap}
@@ -771,6 +799,7 @@ export default function InventoryPage() {
             </div>
           )}
           <MaterialTypeSelect
+            grades={activeGrades}
             value={selectedType}
             onChange={setSelectedType}
             canChooseScrap={canScrap}
