@@ -4,7 +4,14 @@ import { formatWeight } from "@/lib/units";
 import { getSession } from "@/lib/auth";
 import { canRead, canWrite, canAmendCompletedBatch } from "@/lib/permissions";
 import { parsePagination, buildPaginationMeta } from "@/lib/pagination";
-import { materialType, isIngotType, gradeName } from "@/lib/ingot";
+import { materialType, gradeName, materialLabel } from "@/lib/ingot";
+import { activeGrades, resolveGrade } from "@/lib/grades";
+import {
+  ChargeRefused,
+  parseChargeLines,
+  stockDemand,
+  type ChargeLine,
+} from "@/lib/charge";
 import type { AluminumType } from "@/types";
 import {
   MAX_OPEN_BATCHES_PER_FURNACE,
@@ -201,16 +208,11 @@ const body = await request.json();
     // when the furnace is charged, so they are added later through PATCH.
     const {
       furnaceId,
-      // The alloy this heat runs on, sent explicitly. It cannot always be
-      // inferred from the weights: a heat charged entirely with re-melted
-      // scrap has no ingot to read a grade from.
-      ingotGrade,
-      aluminumUsedLM6,
-      aluminumUsedLM9,
-      aluminumUsedLM25,
-      runnerRaiserScrapUsed,
-      spillageScrapUsed,
-      rejectedPartScrapUsed,
+      /*
+       * The charge and the declared result come off the body in parseChargeLines
+       * (lib/charge.ts), which also reads the older per-grade fields so a
+       * browser left open on the previous version still saves a correct batch.
+       */
       // The batch whose leftover metal is being melted into this one, if any
       carriedFromId,
       // The shop-floor employee who ran this heat
@@ -229,38 +231,14 @@ const body = await request.json();
       notes,
     } = body;
 
-    // A batch may be charged with one grade, two, or all three. The total is
-    // derived from the grades so the two can never disagree.
-    const ingotCharge = [
-      { type: "INGOT_LM6" as const, grade: "LM6", amount: parseFloat(aluminumUsedLM6) || 0 },
-      { type: "INGOT_LM9" as const, grade: "LM9", amount: parseFloat(aluminumUsedLM9) || 0 },
-      { type: "INGOT_LM25" as const, grade: "LM25", amount: parseFloat(aluminumUsedLM25) || 0 },
-    ];
-
-    for (const ingot of ingotCharge) {
-      if (ingot.amount < 0) {
-        return NextResponse.json(
-          { error: `${ingot.grade} used cannot be negative` },
-          { status: 400 }
-        );
-      }
-    }
-
-    const aluminumUsedNum = ingotCharge.reduce((sum, i) => sum + i.amount, 0);
-
-    // A heat runs on one alloy, and that grade governs every scrap movement
-    // below - what may be re-melted in, and what grade the scrap coming off it
-    // becomes. Taken from the caller when given; otherwise from whichever
-    // grade holds the most metal, which is how older callers expressed it.
-    const batchIngotType =
-      typeof ingotGrade === "string" && isIngotType(ingotGrade as AluminumType)
-        ? (ingotGrade as AluminumType)
-        : materialType(
-            "INGOT",
-            ingotCharge.reduce((best, i) => (i.amount > best.amount ? i : best))
-              .grade
-          );
-    const batchGrade = gradeName(batchIngotType);
+    /*
+     * What went into the furnace, and what it comes out as.
+     *
+     * Lines, not fixed columns: any number of alloys in any form. The heel is
+     * added further down, once the batch it comes from has been checked, so
+     * its weight and grade are taken from that record rather than the request.
+     */
+    const grades = await activeGrades();
 
     if (!furnaceId) {
       return NextResponse.json(
@@ -295,38 +273,6 @@ const body = await request.json();
       );
     }
 
-    // Scrap is graded, and a heat may only re-melt scrap of its own alloy -
-    // charging LM9 runners into an LM6 heat would put the melt out of spec. So
-    // the batch grade decides which stock lines these weights move.
-    const scrapUsed = [
-      {
-        type: materialType("RUNNER_RAISER", batchGrade),
-        label: `${batchGrade} Runner & Raiser`,
-        amount: parseFloat(runnerRaiserScrapUsed) || 0,
-      },
-      {
-        type: materialType("SPILLAGE", batchGrade),
-        label: `${batchGrade} Spillage`,
-        amount: parseFloat(spillageScrapUsed) || 0,
-      },
-      {
-        type: materialType("REJECTED_PART", batchGrade),
-        label: `${batchGrade} Rejected Part`,
-        amount: parseFloat(rejectedPartScrapUsed) || 0,
-      },
-    ];
-
-    for (const scrap of scrapUsed) {
-      if (scrap.amount < 0) {
-        return NextResponse.json(
-          { error: `${scrap.label} scrap used cannot be negative` },
-          { status: 400 }
-        );
-      }
-    }
-
-    const totalScrapUsedNum = scrapUsed.reduce((sum, s) => sum + s.amount, 0);
-
     /*
      * Metal carried over from the previous heat on this furnace.
      *
@@ -337,6 +283,7 @@ const body = await request.json();
      */
     let carriedIn = 0;
     let heelSource: { id: string; batchNumber: string } | null = null;
+    let heelGrade: Awaited<ReturnType<typeof resolveGrade>> = null;
 
     if (carriedFromId) {
       const source = await prisma.productionRecord.findUnique({
@@ -383,19 +330,18 @@ const body = await request.json();
           { status: 400 }
         );
       }
-      // Pouring an LM6 heel into an LM9 heat contaminates the alloy, the same
-      // reason scrap is kept per grade
-      if (source.ingotGrade !== batchIngotType) {
-        return NextResponse.json(
-          {
-            error: `Batch ${source.batchNumber} left ${gradeName(source.ingotGrade)} metal, which cannot be melted into a ${gradeName(batchIngotType)} heat`,
-          },
-          { status: 400 }
-        );
-      }
-
       carriedIn = source.metalRemaining;
       heelSource = { id: source.id, batchNumber: source.batchNumber };
+      /*
+       * The heel's alloy is whatever that heat came out as.
+       *
+       * No longer required to match this heat: that metal is simply another
+       * input, and the operator declares what the mixture comes out as. An
+       * LM10 heel charged with fresh LM6 may well be declared LM11.
+       */
+      heelGrade =
+        (await resolveGrade(source.resultGradeId ?? source.ingotGrade, grades)) ??
+        null;
     }
 
     /*
@@ -487,46 +433,37 @@ const body = await request.json();
       backdated = { batchNumber: number, date: when };
     }
 
-    // Something has to go into the furnace, but it does not have to be fresh
-    // ingot - a heat run entirely on re-melted scrap, or entirely on what the
-    // last heat left behind, is ordinary foundry work. So the requirement is on
-    // the CHARGE, not on the ingot alone.
-    if (aluminumUsedNum + totalScrapUsedNum + carriedIn <= 0) {
-      return NextResponse.json(
-        {
-          error:
-            "Enter the ingot or the scrap charged into this heat, or carry over the metal left in the furnace",
-        },
-        { status: 400 }
-      );
-    }
-
-    // Each grade is its own stock line, so each is checked on its own
-    for (const ingot of ingotCharge) {
-      if (ingot.amount <= 0) continue;
-      const stock = await prisma.inventory.findUnique({ where: { type: ingot.type } });
-      const available = stock?.quantity ?? 0;
-      if (available < ingot.amount) {
-        return NextResponse.json(
-          {
-            error: `Not enough ${ingot.grade} ingot in stock - ${formatWeight(available)} available`,
-          },
-          { status: 400 }
-        );
+    /*
+     * Now the charge can be read: the heel's weight and grade come from the
+     * batch it is taken from, not from the request.
+     */
+    let charge;
+    try {
+      charge = await parseChargeLines(body, {
+        carriedIn,
+        carriedInGrade: heelGrade,
+        grades,
+      });
+    } catch (err) {
+      if (err instanceof ChargeRefused) {
+        return NextResponse.json({ error: err.message }, { status: 400 });
       }
+      throw err;
     }
 
-    // A batch can consume and generate the same scrap type, so availability is
-    // checked against stock as it stands now - before this batch's own scrap
-    // is added.
-    for (const scrap of scrapUsed) {
-      if (scrap.amount <= 0) continue;
-      const stock = await prisma.inventory.findUnique({ where: { type: scrap.type } });
+    /*
+     * Each line is checked against its own stock line before anything is
+     * written. A batch can consume and generate the same scrap type, so
+     * availability is read as stock stands now - before this batch's own
+     * scrap is added.
+     */
+    for (const [type, needed] of stockDemand(charge.lines)) {
+      const stock = await prisma.inventory.findUnique({ where: { type } });
       const available = stock?.quantity ?? 0;
-      if (available < scrap.amount) {
+      if (available < needed) {
         return NextResponse.json(
           {
-            error: `Not enough ${scrap.label} scrap in stock - ${formatWeight(available)} available`,
+            error: `Not enough ${materialLabel(type)} in stock - ${formatWeight(needed)} needed, ${formatWeight(available)} available`,
           },
           { status: 400 }
         );
@@ -561,15 +498,23 @@ const body = await request.json();
           // has come out of it yet. Output, scrap and assay stay at their
           // defaults until the later stages fill them in.
           status: "PENDING",
-          aluminumUsed: aluminumUsedNum,
-          ingotGrade: batchIngotType,
-          aluminumUsedLM6: ingotCharge[0].amount,
-          aluminumUsedLM9: ingotCharge[1].amount,
-          aluminumUsedLM25: ingotCharge[2].amount,
-          runnerRaiserScrapUsed: scrapUsed[0].amount,
-          spillageScrapUsed: scrapUsed[1].amount,
-          rejectedPartScrapUsed: scrapUsed[2].amount,
-          totalScrapUsed: totalScrapUsedNum,
+          // The alloy declared for this heat, and the charge that made it
+          resultGradeId: charge.resultGrade.id,
+          charges: {
+            create: charge.lines.map((line) => ({
+              gradeId: line.grade.id,
+              form: line.form,
+              weight: line.weight,
+              fromHeel: line.fromHeel,
+            })),
+          },
+          /*
+           * The old columns, kept in step with the charge lines so every
+           * report, export and screen written against them keeps reading.
+           * They can only describe LM6, LM9 and LM25; the lines above are
+           * what the batch actually was.
+           */
+          ...charge.legacy,
           // Part of the charge, deliberately absent from every stock movement
           // below - this metal never went back into inventory to be taken out
           carriedInWeight: carriedIn,
@@ -584,64 +529,58 @@ const body = await request.json();
               part: { select: { id: true, name: true, partCode: true } },
             },
           },
+          charges: { include: { grade: { select: { id: true, name: true } } } },
+          resultGrade: { select: { id: true, name: true } },
           furnace: { select: { id: true, name: true } },
           operator: { select: { id: true, name: true, employeeCode: true } },
           user: { select: { name: true } },
         },
       });
 
-      // Deduct each grade from its own stock line, with its own log entry, so
-      // the audit trail says which metal actually went into the furnace.
-      for (const ingot of ingotCharge) {
-        if (ingot.amount <= 0) continue;
+      /*
+       * One stock movement per charge line, each with its own log entry, so
+       * the audit trail says exactly which metal went into the furnace.
+       * Heel lines move nothing - that metal left stock when the previous
+       * heat was charged.
+       */
+      for (const line of charge.lines as ChargeLine[]) {
+        if (line.fromHeel) continue;
+        const type = materialType(line.form, line.grade.name);
 
-        const stock = await tx.inventory.findUnique({ where: { type: ingot.type } });
+        const stock = await tx.inventory.findUnique({ where: { type } });
         const prevQty = stock?.quantity ?? 0;
 
-        await tx.inventory.update({
-          where: { type: ingot.type },
-          data: { quantity: { decrement: ingot.amount }, lastUpdated: new Date() },
-        });
-
-        await tx.inventoryLog.create({
-          data: {
-            type: ingot.type,
-            action: "REMOVE",
-            quantity: -ingot.amount,
-            previousQty: prevQty,
-            newQty: prevQty - ingot.amount,
-            reference: "Production",
-            referenceId: record.id,
-            notes: `Used in production batch ${batchNumber}`,
-            createdBy: session.id,
+        await tx.inventory.upsert({
+          where: { type },
+          create: {
+            type,
+            gradeId: line.grade.id,
+            form: line.form,
+            quantity: -line.weight,
+          },
+          update: {
+            quantity: { decrement: line.weight },
+            gradeId: line.grade.id,
+            form: line.form,
+            lastUpdated: new Date(),
           },
         });
-      }
-
-      // Deduct any scrap charged back into the melt. This runs before the new
-      // scrap is added so the log's previousQty/newQty read in the order the
-      // metal actually moved.
-      for (const scrap of scrapUsed) {
-        if (scrap.amount <= 0) continue;
-
-        const stock = await tx.inventory.findUnique({ where: { type: scrap.type } });
-        const prevQty = stock?.quantity ?? 0;
-
-        await tx.inventory.update({
-          where: { type: scrap.type },
-          data: { quantity: { decrement: scrap.amount }, lastUpdated: new Date() },
-        });
 
         await tx.inventoryLog.create({
           data: {
-            type: scrap.type,
+            type,
+            gradeId: line.grade.id,
+            form: line.form,
             action: "REMOVE",
-            quantity: -scrap.amount,
+            quantity: -line.weight,
             previousQty: prevQty,
-            newQty: prevQty - scrap.amount,
+            newQty: prevQty - line.weight,
             reference: "Production",
             referenceId: record.id,
-            notes: `Re-melted in production batch ${batchNumber}`,
+            notes:
+              line.form === "INGOT"
+                ? `Used in production batch ${batchNumber}`
+                : `Re-melted in production batch ${batchNumber}`,
             createdBy: session.id,
           },
         });

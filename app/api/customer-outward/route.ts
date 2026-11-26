@@ -28,8 +28,10 @@ const dispatchInclude = {
   company: { select: { id: true, name: true, gstNumber: true, city: true } },
   customerOrder: { select: { id: true, poNumber: true } },
   user: { select: { name: true } },
-  supervisor: { select: { id: true, employeeCode: true, name: true } },
-  qcCheckedBy: { select: { id: true, employeeCode: true, name: true } },
+  // Only to read the name off notes recorded while these were a pick from the
+  // employee list; new notes carry the names on the dispatch itself
+  supervisor: { select: { name: true } },
+  qcCheckedBy: { select: { name: true } },
   items: {
     include: {
       part: { select: { id: true, partCode: true, name: true, weightPerPiece: true } },
@@ -214,8 +216,15 @@ export async function GET(request: NextRequest) {
           vehicleNumber: dispatch.vehicleNumber,
           driverName: dispatch.driverName,
           invoiceNumber: dispatch.invoiceNumber,
-          supervisor: dispatch.supervisor,
-          qcCheckedBy: dispatch.qcCheckedBy,
+          /*
+           * The typed name, falling back to the employee a note was linked to
+           * before these became free text. One string either way, so the
+           * screens do not have to know which era a note came from.
+           */
+          supervisorName:
+            dispatch.supervisorName ?? dispatch.supervisor?.name ?? null,
+          qcCheckedByName:
+            dispatch.qcCheckedByName ?? dispatch.qcCheckedBy?.name ?? null,
           notes: dispatch.notes,
           recordedBy: dispatch.user?.name ?? null,
           items: dispatch.items.map((item) => ({
@@ -322,35 +331,21 @@ export async function POST(request: NextRequest) {
     }
 
     /*
-     * Supervisor and QC checker. Both optional on the request, but when a name
-     * is sent it has to be a real employee who is still on the books - a note
-     * that says a casting was passed by somebody who does not exist is worse
-     * than one that says nothing.
+     * Who supervised the load and who passed it, as typed.
+     *
+     * Not checked against the employee list: the man loading a lorry is often
+     * not on it - a driver, a contractor, somebody covering a shift - and
+     * refusing the note would mean the castings leave with nothing recorded
+     * at all. Both stay optional for the same reason.
      */
-    const supervisorId = body.supervisorId ? String(body.supervisorId) : null;
-    const qcCheckedById = body.qcCheckedById ? String(body.qcCheckedById) : null;
-    const namedIds = [supervisorId, qcCheckedById].filter(
-      (id): id is string => id !== null
-    );
-    if (namedIds.length > 0) {
-      const found = await prisma.employee.findMany({
-        where: { id: { in: [...new Set(namedIds)] }, isActive: true },
-        select: { id: true },
-      });
-      const alive = new Set(found.map((e) => e.id));
-      if (supervisorId && !alive.has(supervisorId)) {
-        return NextResponse.json(
-          { error: "That dispatch supervisor is not an active employee" },
-          { status: 400 }
-        );
-      }
-      if (qcCheckedById && !alive.has(qcCheckedById)) {
-        return NextResponse.json(
-          { error: "That quality checker is not an active employee" },
-          { status: 400 }
-        );
-      }
-    }
+    const supervisorName =
+      typeof body.supervisorName === "string"
+        ? body.supervisorName.trim().slice(0, 120) || null
+        : null;
+    const qcCheckedByName =
+      typeof body.qcCheckedByName === "string"
+        ? body.qcCheckedByName.trim().slice(0, 120) || null
+        : null;
 
     const created = await prisma.$transaction(async (tx) => {
       // The number is taken inside the transaction so two notes written at
@@ -372,8 +367,8 @@ export async function POST(request: NextRequest) {
           vehicleNumber: body.vehicleNumber?.trim() || null,
           driverName: body.driverName?.trim() || null,
           invoiceNumber: body.invoiceNumber?.trim() || null,
-          supervisorId,
-          qcCheckedById,
+          supervisorName,
+          qcCheckedByName,
           notes: body.notes?.trim() || null,
           createdBy: session.id,
           items: {

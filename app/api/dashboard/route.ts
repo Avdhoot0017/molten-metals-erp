@@ -1,12 +1,12 @@
 import { NextResponse } from "next/server";
 import {
-  GRADE_NAMES,
   ingotSplit,
   materialType,
   scrapSplit,
   totalIngot,
   type MaterialForm,
 } from "@/lib/ingot";
+import { activeGrades } from "@/lib/grades";
 import { expectedScrapOf } from "@/lib/parts";
 import prisma from "@/lib/prisma";
 import { getSettings } from "@/lib/settings";
@@ -79,6 +79,35 @@ export async function GET() {
       _count: true,
     });
 
+    /*
+     * What was charged today and this month, by alloy.
+     *
+     * Read from the charge rows rather than the three per-grade columns on the
+     * batch: those can only name LM6, LM9 and LM25, so a heat charged with
+     * anything else would simply not appear. Heel lines are left out - that
+     * metal was charged, and counted, when the previous heat was recorded.
+     */
+    const chargedByGrade = async (from: Date, to: Date) => {
+      const rows = await prisma.productionCharge.groupBy({
+        by: ["gradeId"],
+        where: {
+          fromHeel: false,
+          form: "INGOT",
+          record: { date: { gte: from, lt: to } },
+        },
+        _sum: { weight: true },
+      });
+      const byType: Record<string, number> = {};
+      for (const row of rows) {
+        const grade = grades.find((g) => g.id === row.gradeId);
+        if (!grade) continue;
+        byType[materialType("INGOT", grade.name)] = row._sum.weight ?? 0;
+      }
+      return byType;
+    };
+    const todayCharged = await chargedByGrade(today, tomorrow);
+    const monthCharged = await chargedByGrade(monthStart, monthEnd);
+
     // Pending purchase orders
     const pendingOrders = await prisma.purchaseOrder.count({
       where: {
@@ -136,21 +165,28 @@ export async function GET() {
     // Every ingot grade rolls up into one headline ingot figure, and the grades
     // are also sent through separately - LM6, LM9 and LM25 are different metal,
     // so a single ingot number hides which alloy is actually running out.
-    const ingotStock = totalIngot(inventoryMap);
-    const ingotByGrade = ingotSplit(inventoryMap);
+    /*
+     * The alloys this foundry runs, read once and used for every split below.
+     * A grade the admin added today has stock lines like any other, so the
+     * list cannot be a constant or its metal would be invisible here.
+     */
+    const grades = await activeGrades();
+
+    const ingotStock = totalIngot(inventoryMap, grades);
+    const ingotByGrade = ingotSplit(inventoryMap, grades);
 
     // Scrap is graded too, so each headline scrap figure is the sum of that
     // form across the three alloys, and scrapByGrade gives the other cut.
     const scrapStockFor = (form: MaterialForm) =>
-      GRADE_NAMES.reduce(
-        (sum, grade) => sum + (inventoryMap[materialType(form, grade)] ?? 0),
+      grades.reduce(
+        (sum, grade) => sum + (inventoryMap[materialType(form, grade.name)] ?? 0),
         0
       );
     const runnerRaiserStock = scrapStockFor("RUNNER_RAISER");
     const spillageStock = scrapStockFor("SPILLAGE");
     const rejectedPartStock = scrapStockFor("REJECTED_PART");
     const totalScrap = runnerRaiserStock + spillageStock + rejectedPartStock;
-    const scrapByGrade = scrapSplit(inventoryMap);
+    const scrapByGrade = scrapSplit(inventoryMap, grades);
 
     // Parts count
     const partsCount = await prisma.part.count({ where: { isActive: true } });
@@ -477,11 +513,7 @@ export async function GET() {
           parts: todayProduction._sum.goodParts || 0,
           batches: todayProduction._count,
           aluminumUsed: todayProduction._sum.aluminumUsed || 0,
-          aluminumByGrade: ingotSplit({
-            INGOT_LM6: todayProduction._sum.aluminumUsedLM6 || 0,
-            INGOT_LM9: todayProduction._sum.aluminumUsedLM9 || 0,
-            INGOT_LM25: todayProduction._sum.aluminumUsedLM25 || 0,
-          }),
+          aluminumByGrade: ingotSplit(todayCharged, grades),
           scrapGenerated: todayProduction._sum.totalScrap || 0,
         },
         month: {
@@ -489,11 +521,7 @@ export async function GET() {
           rejectedParts: monthProduction._sum.rejectedParts || 0,
           batches: monthProduction._count,
           aluminumUsed: monthProduction._sum.aluminumUsed || 0,
-          aluminumByGrade: ingotSplit({
-            INGOT_LM6: monthProduction._sum.aluminumUsedLM6 || 0,
-            INGOT_LM9: monthProduction._sum.aluminumUsedLM9 || 0,
-            INGOT_LM25: monthProduction._sum.aluminumUsedLM25 || 0,
-          }),
+          aluminumByGrade: ingotSplit(monthCharged, grades),
           scrapGenerated: monthProduction._sum.totalScrap || 0,
           avgEfficiency: monthProduction._avg.efficiency || 0,
         },

@@ -26,7 +26,8 @@ import { StatCard } from "@/components/ui/stat-card";
 import { formatWeight, formatCurrency, formatDate, formatDateTime } from "@/lib/utils";
 import { downloadPurchaseOrderPdf } from "@/lib/po-pdf";
 import { parseWeightInput, weightForExport, WEIGHT_UNIT } from "@/lib/units";
-import { INGOT_GRADES, gradeName } from "@/lib/ingot";
+import { ingotGradesFor, gradeName } from "@/lib/ingot";
+import { useGrades } from "@/lib/use-grades";
 import type { AluminumType } from "@/types";
 import {
   exportToExcel,
@@ -76,6 +77,8 @@ const statusConfig: Record<POStatus, { label: string; variant: "default" | "succ
 };
 
 export default function PurchaseOrdersPage() {
+  // Which alloys may be bought, from the master in Settings
+  const { active: activeGrades } = useGrades();
   const [purchaseOrders, setPurchaseOrders] = React.useState<PurchaseOrder[]>([]);
   const [suppliers, setSuppliers] = React.useState<Supplier[]>([]);
   const [isPageLoading, setIsPageLoading] = React.useState(true);
@@ -609,9 +612,16 @@ export default function PurchaseOrdersPage() {
           />
           <Select
             label="Ingot Grade"
-            options={INGOT_GRADES.map((g) => ({
+            /*
+             * Only the alloys the foundry buys in. A grade that only ever
+             * comes out of the furnace holds scrap stock but has no business
+             * on a purchase order, so the master says which ones these are.
+             */
+            options={ingotGradesFor(
+              activeGrades.filter((g) => g.canBePurchased)
+            ).map((g) => ({
               value: g.type,
-              label: `${g.label} - ${g.description}`,
+              label: g.description ? `${g.label} - ${g.description}` : g.label,
             }))}
             value={formData.ingotType}
             onChange={(value) =>

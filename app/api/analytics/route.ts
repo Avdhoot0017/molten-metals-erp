@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { ingotSplit, isIngotType, isScrapType } from "@/lib/ingot";
+import { ingotSplit, isIngotType, isScrapType, materialType } from "@/lib/ingot";
+import { activeGrades } from "@/lib/grades";
 import prisma from "@/lib/prisma";
 import { getSession } from "@/lib/auth";
 import { canRead, canWrite } from "@/lib/permissions";
@@ -31,9 +32,14 @@ export async function GET() {
         items: {
           include: { part: { select: { name: true, partCode: true } } },
         },
+        // What went in, by alloy. The old per-grade columns can only name the
+        // original three, so a heat run on a newer grade would read as zero.
+        charges: { include: { grade: { select: { id: true, name: true } } } },
       },
       orderBy: { createdAt: "asc" },
     });
+
+    const grades = await activeGrades();
 
     // Fetch purchase orders
     const purchaseOrders = await prisma.purchaseOrder.findMany({
@@ -154,11 +160,16 @@ export async function GET() {
       (sum, r) => sum + r.aluminumUsed,
       0
     );
-    const ingotBreakdown = ingotSplit({
-      INGOT_LM6: productionRecords.reduce((sum, r) => sum + r.aluminumUsedLM6, 0),
-      INGOT_LM9: productionRecords.reduce((sum, r) => sum + r.aluminumUsedLM9, 0),
-      INGOT_LM25: productionRecords.reduce((sum, r) => sum + r.aluminumUsedLM25, 0),
-    });
+    const chargedByType: Record<string, number> = {};
+    for (const record of productionRecords) {
+      for (const line of record.charges) {
+        // Heel metal was counted when the heat it came from was charged
+        if (line.fromHeel || line.form !== "INGOT") continue;
+        const type = materialType("INGOT", line.grade.name);
+        chargedByType[type] = (chargedByType[type] ?? 0) + line.weight;
+      }
+    }
+    const ingotBreakdown = ingotSplit(chargedByType, grades);
 
     // Inventory trend (current values only for now)
     // Ingot is stocked per grade, so the trend line is the sum of the grades
@@ -172,7 +183,7 @@ export async function GET() {
     const scrapInventory = inventory
       .filter((i) => isScrapType(i.type))
       .reduce((sum, i) => sum + i.quantity, 0);
-    const ingotStockByGrade = ingotSplit(inventoryMap);
+    const ingotStockByGrade = ingotSplit(inventoryMap, grades);
 
     // Top clients (companies with most dispatches would come from dispatch records)
     // For now, we'll use companies data

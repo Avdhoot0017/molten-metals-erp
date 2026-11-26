@@ -10,11 +10,15 @@ import {
 import { parseComposition } from "@/lib/composition";
 import {
   materialType,
+  materialLabel,
   gradeName,
   isIngotType,
-  GRADE_NAMES,
+  parseMaterialType,
+  type MaterialForm,
   SCRAP_FORMS,
 } from "@/lib/ingot";
+import { activeGrades, resolveGrade } from "@/lib/grades";
+import { ChargeRefused, parseChargeLines, type ChargeLine } from "@/lib/charge";
 import type { AluminumType } from "@/types";
 import { Prisma } from "@prisma/client";
 import { castingOutput, chargeOf, suggestedHeel } from "@/lib/production";
@@ -37,12 +41,13 @@ import {
  */
 function batchMovements(batch: {
   ingotGrade: string;
-  aluminumUsedLM6: number;
-  aluminumUsedLM9: number;
-  aluminumUsedLM25: number;
-  runnerRaiserScrapUsed: number;
-  spillageScrapUsed: number;
-  rejectedPartScrapUsed: number;
+  /** The charge, one row per grade and form. Heel lines move no stock. */
+  charges?: Array<{
+    form: string;
+    weight: number;
+    fromHeel: boolean;
+    grade: { name: string };
+  }>;
   runnerRaiserScrap: number;
   spillageScrap: number;
   rejectedPartScrap: number;
@@ -53,32 +58,29 @@ function batchMovements(batch: {
     moves.set(type, (moves.get(type) ?? 0) + amount);
   };
 
-  // Ingot charged leaves its grade's stock line
-  const perGrade: Record<string, number> = {
-    LM6: batch.aluminumUsedLM6,
-    LM9: batch.aluminumUsedLM9,
-    LM25: batch.aluminumUsedLM25,
-  };
-  for (const grade of GRADE_NAMES) {
-    add(materialType("INGOT", grade), -(perGrade[grade] ?? 0));
+  /*
+   * Everything charged leaves the stock line it was charged from - whatever
+   * grade, whatever form. Read from the charge rows rather than the old fixed
+   * columns, because a heat may now be charged with an alloy those columns
+   * were never able to name.
+   *
+   * A heel line is skipped: that metal left inventory when the previous heat
+   * was charged, and taking it out again would remove the same kilos twice.
+   */
+  for (const line of batch.charges ?? []) {
+    if (line.fromHeel) continue;
+    add(materialType(line.form as MaterialForm, line.grade.name), -line.weight);
   }
 
-  // Scrap re-melted leaves, scrap generated arrives - both on the heat's grade
+  // Scrap coming off arrives on the alloy the heat came out as
   const grade = gradeName(batch.ingotGrade as AluminumType);
-  const used: Record<string, number> = {
-    RUNNER_RAISER: batch.runnerRaiserScrapUsed,
-    SPILLAGE: batch.spillageScrapUsed,
-    REJECTED_PART: batch.rejectedPartScrapUsed,
-  };
   const made: Record<string, number> = {
     RUNNER_RAISER: batch.runnerRaiserScrap,
     SPILLAGE: batch.spillageScrap,
     REJECTED_PART: batch.rejectedPartScrap,
   };
   for (const form of SCRAP_FORMS) {
-    const type = materialType(form.form, grade);
-    add(type, -(used[form.form] ?? 0));
-    add(type, made[form.form] ?? 0);
+    add(materialType(form.form, grade), made[form.form] ?? 0);
   }
 
   return moves;
@@ -146,6 +148,12 @@ const recordInclude = {
   // are shown on the batch so a heel can be traced without another query.
   carriedFrom: { select: { id: true, batchNumber: true } },
   carriedTo: { select: { id: true, batchNumber: true } },
+  // What went in, line by line, and what the operator declared it came out as
+  charges: {
+    include: { grade: { select: { id: true, name: true, colorHex: true } } },
+    orderBy: [{ fromHeel: "asc" }, { form: "asc" }],
+  },
+  resultGrade: { select: { id: true, name: true, colorHex: true } },
 } satisfies Prisma.ProductionRecordInclude;
 
 // GET - One production record
@@ -220,9 +228,17 @@ export async function PATCH(
 
     const record = await prisma.productionRecord.findUnique({
       where: { id },
-      // carriedTo says whether the next heat has already melted this batch's
-      // leftover metal, which decides whether that figure may still change
-      include: { items: true, carriedTo: { select: { batchNumber: true } } },
+      /*
+       * carriedTo says whether the next heat has already melted this batch's
+       * leftover metal, which decides whether that figure may still change.
+       * The charge lines come too: amending settles stock by comparing the
+       * movements this batch used to be responsible for with the new ones.
+       */
+      include: {
+        items: true,
+        carriedTo: { select: { batchNumber: true } },
+        charges: { include: { grade: { select: { name: true } } } },
+      },
     });
     if (!record) {
       return NextResponse.json({ error: "Batch not found" }, { status: 404 });
@@ -278,7 +294,11 @@ export async function PATCH(
  * Shared with the create route's rules so an amendment cannot save something
  * the original form would have refused.
  */
-async function parseCharge(body: Record<string, unknown>, currentFurnaceId: string | null) {
+async function parseCharge(
+  body: Record<string, unknown>,
+  currentFurnaceId: string | null,
+  heel: { weight: number; gradeId: string | null } = { weight: 0, gradeId: null }
+) {
   const furnaceId = (body.furnaceId as string) || currentFurnaceId;
   if (!furnaceId) {
     return { error: NextResponse.json({ error: "Furnace is required" }, { status: 400 }) };
@@ -288,75 +308,24 @@ async function parseCharge(body: Record<string, unknown>, currentFurnaceId: stri
     return { error: NextResponse.json({ error: "Furnace not found" }, { status: 404 }) };
   }
 
-  const ingotCharge = [
-    { grade: "LM6", amount: Number(body.aluminumUsedLM6) || 0 },
-    { grade: "LM9", amount: Number(body.aluminumUsedLM9) || 0 },
-    { grade: "LM25", amount: Number(body.aluminumUsedLM25) || 0 },
-  ];
-  for (const ingot of ingotCharge) {
-    if (ingot.amount < 0) {
-      return {
-        error: NextResponse.json(
-          { error: `${ingot.grade} used cannot be negative` },
-          { status: 400 }
-        ),
-      };
+  const grades = await activeGrades();
+  const heelGrade = heel.gradeId
+    ? await resolveGrade(heel.gradeId, grades)
+    : null;
+
+  try {
+    const charge = await parseChargeLines(body, {
+      carriedIn: heel.weight,
+      carriedInGrade: heelGrade,
+      grades,
+    });
+    return { furnaceId, charge };
+  } catch (err: unknown) {
+    if (err instanceof ChargeRefused) {
+      return { error: NextResponse.json({ error: err.message }, { status: 400 }) };
     }
+    throw err;
   }
-
-  const aluminumUsedNum = ingotCharge.reduce((sum, i) => sum + i.amount, 0);
-
-  // Taken from the caller when given, because a heat charged entirely with
-  // re-melted scrap has no ingot to read a grade from
-  const batchIngotType =
-    typeof body.ingotGrade === "string" &&
-    isIngotType(body.ingotGrade as AluminumType)
-      ? (body.ingotGrade as AluminumType)
-      : materialType(
-          "INGOT",
-          ingotCharge.reduce((best, i) => (i.amount > best.amount ? i : best))
-            .grade
-        );
-  const batchGrade = gradeName(batchIngotType);
-
-  const scrapUsed = [
-    { form: "RUNNER_RAISER" as const, label: "Runner & Raiser", amount: Number(body.runnerRaiserScrapUsed) || 0 },
-    { form: "SPILLAGE" as const, label: "Spillage", amount: Number(body.spillageScrapUsed) || 0 },
-    { form: "REJECTED_PART" as const, label: "Rejected Part", amount: Number(body.rejectedPartScrapUsed) || 0 },
-  ];
-  for (const scrap of scrapUsed) {
-    if (scrap.amount < 0) {
-      return {
-        error: NextResponse.json(
-          { error: `${scrap.label} scrap used cannot be negative` },
-          { status: 400 }
-        ),
-      };
-    }
-  }
-
-  const totalScrapUsedNum = scrapUsed.reduce((sum, s) => sum + s.amount, 0);
-
-  // Something has to go into the furnace, but it does not have to be fresh
-  // ingot - a heat run entirely on re-melted scrap is ordinary foundry work.
-  if (aluminumUsedNum + totalScrapUsedNum <= 0) {
-    return {
-      error: NextResponse.json(
-        { error: "Enter the ingot or the scrap charged into this heat" },
-        { status: 400 }
-      ),
-    };
-  }
-
-  return {
-    furnaceId,
-    ingotCharge,
-    aluminumUsedNum,
-    batchGrade,
-    batchIngotType,
-    scrapUsed,
-    totalScrapUsedNum,
-  };
 }
 
 /** The output half: castings counted and scrap booked. */
@@ -514,11 +483,26 @@ function parseMelt(body: Record<string, unknown>) {
  */
 async function amendBatch(
   id: string,
-  record: Prisma.ProductionRecordGetPayload<{ include: { items: true; carriedTo: { select: { batchNumber: true } } } }>,
+  record: Prisma.ProductionRecordGetPayload<{
+    include: {
+      items: true;
+      carriedTo: { select: { batchNumber: true } };
+      charges: { include: { grade: { select: { name: true } } } };
+    };
+  }>,
   body: Record<string, unknown>,
   userId: string
 ) {
-  const charge = await parseCharge(body, record.furnaceId);
+  /*
+   * The heel is not editable here and is passed through untouched: its weight
+   * and alloy belong to the batch it came from, and this correction is about
+   * what THIS heat was charged with.
+   */
+  const charge = await parseCharge(body, record.furnaceId, {
+    weight: record.carriedInWeight,
+    gradeId:
+      record.charges.find((c) => c.fromHeel)?.gradeId ?? record.resultGradeId,
+  });
   if ("error" in charge) return charge.error;
 
   const output = await parseOutput(body);
@@ -528,16 +512,18 @@ async function amendBatch(
   if ("error" in melt) return melt.error;
 
   const next = {
-    ingotGrade: charge.batchIngotType,
-    aluminumUsedLM6: charge.ingotCharge[0].amount,
-    aluminumUsedLM9: charge.ingotCharge[1].amount,
-    aluminumUsedLM25: charge.ingotCharge[2].amount,
-    runnerRaiserScrapUsed: charge.scrapUsed[0].amount,
-    spillageScrapUsed: charge.scrapUsed[1].amount,
-    rejectedPartScrapUsed: charge.scrapUsed[2].amount,
+    ...charge.charge.legacy,
+    resultGradeId: charge.charge.resultGrade.id,
     runnerRaiserScrap: output.runnerRaiserScrap,
     spillageScrap: output.spillageScrap,
     rejectedPartScrap: output.rejectedPartScrap,
+    // The charge as lines, in the shape batchMovements reads
+    charges: charge.charge.lines.map((line: ChargeLine) => ({
+      form: line.form as string,
+      weight: line.weight,
+      fromHeel: line.fromHeel,
+      grade: { name: line.grade.name },
+    })),
   };
 
   // What changes, line by line: the new movements minus the old ones
@@ -558,27 +544,46 @@ async function amendBatch(
     if (available + delta < 0) {
       return NextResponse.json(
         {
-          error: `That correction needs ${formatWeight(-delta)} of ${type}, but only ${formatWeight(available)} is in stock.`,
+          error: `That correction needs ${formatWeight(-delta)} of ${materialLabel(type)}, but only ${formatWeight(available)} is in stock.`,
         },
         { status: 400 }
       );
     }
   }
 
-  const meltInput = charge.aluminumUsedNum + charge.totalScrapUsedNum;
+  // The heel counts towards what the furnace held, but a correction to this
+  // batch's own charge is what is being settled here
+  const meltInput = charge.charge.chargedFromStock;
   const efficiency = meltInput > 0 ? (output.expectedOutput / meltInput) * 100 : 0;
 
 
   const result = await prisma.$transaction(async (tx) => {
     await tx.productionItem.deleteMany({ where: { productionRecordId: id } });
 
+    /*
+     * The charge is replaced, not patched: a corrected heat may have dropped
+     * a grade entirely, and there is no safe way to express that as an update
+     * per line. The heel line is rebuilt from the same source, so nothing
+     * about the carried-over metal changes.
+     */
+    await tx.productionCharge.deleteMany({ where: { productionRecordId: id } });
+
+    const { charges: chargeLines, ...columns } = next;
+    void chargeLines;
+
     const updated = await tx.productionRecord.update({
       where: { id },
       data: {
-        ...next,
+        ...columns,
         ...(charge.furnaceId ? { furnaceId: charge.furnaceId } : {}),
-        aluminumUsed: charge.aluminumUsedNum,
-        totalScrapUsed: charge.totalScrapUsedNum,
+        charges: {
+          create: charge.charge.lines.map((line: ChargeLine) => ({
+            gradeId: line.grade.id,
+            form: line.form,
+            weight: line.weight,
+            fromHeel: line.fromHeel,
+          })),
+        },
         items: { create: output.items },
         quantityProduced: output.quantityProduced,
         goodParts: output.goodParts,
@@ -601,15 +606,25 @@ async function amendBatch(
       const stock = await tx.inventory.findUnique({ where: { type } });
       const prevQty = stock?.quantity ?? 0;
 
+      const line = await resolveGrade(gradeName(type));
       await tx.inventory.upsert({
         where: { type },
-        update: { quantity: { increment: delta }, lastUpdated: new Date() },
-        create: { type, quantity: Math.max(0, delta) },
+        update: {
+          quantity: { increment: delta },
+          lastUpdated: new Date(),
+          ...(line ? { gradeId: line.id, form: parseMaterialType(type).form } : {}),
+        },
+        create: {
+          type,
+          quantity: Math.max(0, delta),
+          ...(line ? { gradeId: line.id, form: parseMaterialType(type).form } : {}),
+        },
       });
 
       await tx.inventoryLog.create({
         data: {
           type,
+          ...(line ? { gradeId: line.id, form: parseMaterialType(type).form } : {}),
           action: "ADJUST",
           quantity: delta,
           previousQty: prevQty,

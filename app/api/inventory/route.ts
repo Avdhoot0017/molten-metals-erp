@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { ALL_MATERIAL_TYPES, isScrapType } from "@/lib/ingot";
+import { materialTypesFor, isScrapType, parseMaterialType } from "@/lib/ingot";
+import { allGrades, resolveGrade } from "@/lib/grades";
 import prisma from "@/lib/prisma";
 import { getSession } from "@/lib/auth";
 import { canRead, canWrite, canAdjustScrapStock } from "@/lib/permissions";
 import { parsePagination, buildPaginationMeta } from "@/lib/pagination";
-import { AluminumType, Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
+import type { AluminumType } from "@/types";
 
 // GET - Get all inventory levels
 export async function GET(request: NextRequest) {
@@ -96,9 +98,18 @@ const body = await request.json();
       );
     }
 
-    const validTypes: AluminumType[] = ALL_MATERIAL_TYPES;
+    /*
+     * Valid lines come from the alloy master, not a constant: a grade the
+     * admin added this morning has four stock lines like any other, and a
+     * hardcoded list would refuse metal that genuinely exists.
+     */
+    const grades = await allGrades();
+    const validTypes: AluminumType[] = materialTypesFor(grades);
     if (!validTypes.includes(type)) {
-      return NextResponse.json({ error: "Invalid inventory type" }, { status: 400 });
+      return NextResponse.json(
+        { error: "That is not a stock line this foundry holds" },
+        { status: 400 }
+      );
     }
 
     // Scrap moves through production - a heat makes it, another re-melts it -

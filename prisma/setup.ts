@@ -30,7 +30,7 @@ import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { Pool } from "pg";
 import bcrypt from "bcryptjs";
-import { ALL_MATERIAL_TYPES } from "@/lib/ingot";
+import { MATERIAL_FORMS, SEED_GRADES, materialType } from "@/lib/ingot";
 import "dotenv/config";
 
 // Prisma 7 connects through an adapter, and .env is not loaded for us
@@ -229,15 +229,35 @@ async function main() {
   // One line per grade-and-form, all at zero. Opening stock is entered through
   // Inventory, or arrives on a delivered purchase order - it is the foundry's
   // figure, not something setup should invent.
-  for (const type of ALL_MATERIAL_TYPES) {
-    await prisma.inventory.upsert({
-      where: { type },
-      // An existing line keeps its quantity - setup must never zero real stock
+  /*
+   * The grades come first: stock lines belong to an alloy, and the alloys are
+   * rows the admin maintains from Settings. Setup only lays down the three
+   * this foundry started with; anything added later is the shop's business.
+   */
+  let lines = 0;
+  for (const seed of SEED_GRADES) {
+    const grade = await prisma.alloyGrade.upsert({
+      where: { name: seed.name },
+      // An existing grade keeps whatever the admin has made of it
       update: {},
-      create: { type, quantity: 0 },
+      create: seed,
     });
+    for (const form of MATERIAL_FORMS) {
+      await prisma.inventory.upsert({
+        where: { type: materialType(form.form, grade.name) },
+        // An existing line keeps its quantity - setup must never zero real stock
+        update: {},
+        create: {
+          type: materialType(form.form, grade.name),
+          gradeId: grade.id,
+          form: form.form,
+          quantity: 0,
+        },
+      });
+      lines += 1;
+    }
   }
-  console.log(`📦 Material stock lines ready: ${ALL_MATERIAL_TYPES.length}`);
+  console.log(`📦 Alloys ready: ${SEED_GRADES.length}, stock lines: ${lines}`);
 
   // ----------------------------------------------------------------- done
 

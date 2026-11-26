@@ -54,22 +54,15 @@ export interface FettlingActivity {
 }
 
 /**
- * A stock line: one alloy grade in one form. Scrap is graded like ingot -
- * see lib/ingot.ts, which owns how these names are composed and read.
+ * A stock line: one alloy grade in one form, named "FORM_GRADE".
+ *
+ * A plain string, not a union of twelve. The grades are rows the admin
+ * maintains, so the set of valid names is only known at runtime - a union
+ * here could not name INGOT_LM40 the day it is created. lib/ingot.ts owns how
+ * these names are composed and read, and the alloy_grades table is what says
+ * which of them exist.
  */
-export type AluminumType =
-  | "INGOT_LM6"
-  | "INGOT_LM9"
-  | "INGOT_LM25"
-  | "RUNNER_RAISER_LM6"
-  | "RUNNER_RAISER_LM9"
-  | "RUNNER_RAISER_LM25"
-  | "SPILLAGE_LM6"
-  | "SPILLAGE_LM9"
-  | "SPILLAGE_LM25"
-  | "REJECTED_PART_LM6"
-  | "REJECTED_PART_LM9"
-  | "REJECTED_PART_LM25";
+export type AluminumType = string;
 
 export type POStatus = "PENDING" | "CONFIRMED" | "IN_TRANSIT" | "DELIVERED" | "CANCELLED";
 

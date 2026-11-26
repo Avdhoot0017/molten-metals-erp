@@ -19,6 +19,7 @@ import {
   Edit2,
   Flame,
   Wrench,
+  Layers,
   Loader2,
 } from "lucide-react";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
@@ -29,11 +30,13 @@ import { Modal } from "@/components/ui/modal";
 import { Badge } from "@/components/ui/badge";
 import { USER_ROLES, USER_ROLE_LABELS, type UserRole } from "@/types";
 import { LoadingSpinner } from "@/components/ui/loading";
+import { gradeNameProblem, normaliseGradeName } from "@/lib/ingot";
 
 type TabType =
   | "profile"
   | "security"
   | "system"
+  | "alloys"
   | "furnaces"
   | "activities"
   | "users";
@@ -42,6 +45,35 @@ interface Furnace {
   id: string;
   name: string;
   isActive: boolean;
+}
+
+/**
+ * An alloy this foundry runs.
+ *
+ * Grades are configured here rather than built in, because a heat charged
+ * with three alloys comes out as a fourth: that fourth has to exist as a
+ * material in its own right - held as scrap, charged into the next heat,
+ * bought as ingot - and only the shop knows which alloys it runs.
+ */
+interface AlloyGradeRow {
+  id: string;
+  name: string;
+  description: string | null;
+  colorHex: string | null;
+  sortOrder: number;
+  isActive: boolean;
+  canBePurchased: boolean;
+  /** Element limits for the assay, or null when none are entered. */
+  compositionSpec?: unknown;
+}
+
+/** One element limit as it is typed in the spec editor. */
+interface SpecRowDraft {
+  key: string;
+  symbol: string;
+  name: string;
+  min: string;
+  max: string;
 }
 
 interface ActivityTypeRow {
@@ -61,6 +93,35 @@ interface UserData {
 
 export default function SettingsPage() {
   const [activeTab, setActiveTab] = React.useState<TabType>("profile");
+
+  /*
+   * The alloy master. Retired grades are loaded too: history still names
+   * them, so the list has to show that they exist and are simply no longer
+   * offered.
+   */
+  const [alloys, setAlloys] = React.useState<AlloyGradeRow[]>([]);
+  const [alloysLoading, setAlloysLoading] = React.useState(true);
+  const [alloyError, setAlloyError] = React.useState<string | null>(null);
+  const [alloyNotice, setAlloyNotice] = React.useState<string | null>(null);
+  const [alloyBusy, setAlloyBusy] = React.useState(false);
+  const [newAlloy, setNewAlloy] = React.useState({
+    name: "",
+    description: "",
+    canBePurchased: true,
+  });
+  /*
+   * The composition spec being edited, if any.
+   *
+   * Kept apart from the inline name edit: the limits are a table of their own
+   * and belong in a dialog, while a name is a single box in the row.
+   */
+  const [specAlloy, setSpecAlloy] = React.useState<AlloyGradeRow | null>(null);
+  const [specRows, setSpecRows] = React.useState<SpecRowDraft[]>([]);
+  const [editingAlloyId, setEditingAlloyId] = React.useState<string | null>(null);
+  const [editingAlloy, setEditingAlloy] = React.useState({
+    name: "",
+    description: "",
+  });
 
   // Furnaces (bhattis) - admin managed, used by the production form
   const [furnaces, setFurnaces] = React.useState<Furnace[]>([]);
@@ -141,6 +202,7 @@ export default function SettingsPage() {
     { id: "profile" as TabType, label: "Profile", icon: User },
     { id: "security" as TabType, label: "Security", icon: Shield },
     { id: "system" as TabType, label: "System", icon: Database },
+    { id: "alloys" as TabType, label: "Aluminium Types", icon: Layers },
     { id: "furnaces" as TabType, label: "Furnaces", icon: Flame },
     { id: "activities" as TabType, label: "Activities", icon: Wrench },
     { id: "users" as TabType, label: "Users", icon: Users },
@@ -998,6 +1060,211 @@ export default function SettingsPage() {
     })();
   }, [loadFurnaces]);
 
+  const loadAlloys = React.useCallback(async () => {
+    try {
+      const res = await fetch("/api/alloy-grades");
+      const result = await res.json();
+      if (result.success) {
+        setAlloys(result.data || []);
+        setAlloyError(null);
+      } else {
+        setAlloyError(result.error || "Failed to load the alloy list");
+      }
+    } catch {
+      setAlloyError("Failed to load the alloy list");
+    } finally {
+      setAlloysLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void loadAlloys();
+  }, [loadAlloys]);
+
+  const handleAddAlloy = async () => {
+    // Checked here as well as on the server so the message arrives as the
+    // name is typed rather than after a round trip
+    const problem = gradeNameProblem(newAlloy.name);
+    if (problem) {
+      setAlloyError(problem);
+      return;
+    }
+    setAlloyBusy(true);
+    setAlloyError(null);
+    setAlloyNotice(null);
+    try {
+      const res = await fetch("/api/alloy-grades", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: normaliseGradeName(newAlloy.name),
+          description: newAlloy.description,
+          canBePurchased: newAlloy.canBePurchased,
+          sortOrder: alloys.length + 1,
+        }),
+      });
+      const result = await res.json();
+      if (result.success) {
+        setNewAlloy({ name: "", description: "", canBePurchased: true });
+        await loadAlloys();
+        setAlloyNotice(
+          `${result.data.name} added, with its four stock lines at zero.`
+        );
+      } else {
+        setAlloyError(result.error || "Failed to add the alloy");
+      }
+    } catch {
+      setAlloyError("Failed to add the alloy");
+    } finally {
+      setAlloyBusy(false);
+    }
+  };
+
+  const handleUpdateAlloy = async (
+    id: string,
+    patch: {
+      name?: string;
+      description?: string;
+      isActive?: boolean;
+      canBePurchased?: boolean;
+    }
+  ) => {
+    if (patch.name !== undefined) {
+      const problem = gradeNameProblem(patch.name);
+      if (problem) {
+        setAlloyError(problem);
+        return;
+      }
+    }
+    setAlloyBusy(true);
+    setAlloyError(null);
+    setAlloyNotice(null);
+    try {
+      const res = await fetch("/api/alloy-grades", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, ...patch }),
+      });
+      const result = await res.json();
+      if (result.success) {
+        setEditingAlloyId(null);
+        await loadAlloys();
+      } else {
+        setAlloyError(result.error || "Failed to save the alloy");
+      }
+    } catch {
+      setAlloyError("Failed to save the alloy");
+    } finally {
+      setAlloyBusy(false);
+    }
+  };
+
+  const handleDeleteAlloy = async (id: string) => {
+    setAlloyBusy(true);
+    setAlloyError(null);
+    setAlloyNotice(null);
+    try {
+      const res = await fetch(`/api/alloy-grades?id=${id}`, { method: "DELETE" });
+      const result = await res.json();
+      if (result.success) {
+        // Reload first: it clears the error banner, which would otherwise
+        // wipe the notice a moment after it was set
+        await loadAlloys();
+        /*
+         * An alloy with stock or history comes back retired rather than
+         * deleted. That is the outcome, not a failure, so it reads as a
+         * notice - and the message says why.
+         */
+        if (result.message) setAlloyNotice(result.message);
+      } else {
+        setAlloyError(result.error || "Failed to remove the alloy");
+      }
+    } catch {
+      setAlloyError("Failed to remove the alloy");
+    } finally {
+      setAlloyBusy(false);
+    }
+  };
+
+  /** Opens the limits dialog, showing whatever the alloy already carries. */
+  const openSpecEditor = (alloy: AlloyGradeRow) => {
+    const rows = Array.isArray(alloy.compositionSpec)
+      ? (alloy.compositionSpec as Array<Record<string, unknown>>)
+      : [];
+    setSpecAlloy(alloy);
+    setSpecRows(
+      rows.length > 0
+        ? rows.map((row, index) => ({
+            key: `spec-${index}`,
+            symbol: String(row.symbol ?? ""),
+            name: String(row.name ?? ""),
+            min: row.min === undefined || row.min === null ? "" : String(row.min),
+            max: row.max === undefined || row.max === null ? "" : String(row.max),
+          }))
+        : [{ key: "spec-0", symbol: "", name: "", min: "", max: "" }]
+    );
+  };
+
+  const handleSaveSpec = async () => {
+    if (!specAlloy) return;
+    const spec = specRows
+      .filter((row) => row.symbol.trim() !== "")
+      .map((row) => ({
+        symbol: row.symbol.trim(),
+        name: row.name.trim() || row.symbol.trim(),
+        ...(row.min.trim() !== "" ? { min: Number(row.min) } : {}),
+        ...(row.max.trim() !== "" ? { max: Number(row.max) } : {}),
+      }));
+    for (const row of spec) {
+      if (
+        (row.min !== undefined && !Number.isFinite(row.min)) ||
+        (row.max !== undefined && !Number.isFinite(row.max))
+      ) {
+        setAlloyError(`${row.symbol}: limits must be numbers`);
+        return;
+      }
+      if (
+        row.min !== undefined &&
+        row.max !== undefined &&
+        row.min > row.max
+      ) {
+        setAlloyError(`${row.symbol}: the minimum is above the maximum`);
+        return;
+      }
+    }
+    setAlloyBusy(true);
+    setAlloyError(null);
+    try {
+      const res = await fetch("/api/alloy-grades", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: specAlloy.id,
+          // An empty table clears the spec: readings are then recorded
+          // without being judged, which is honest for an alloy nobody has
+          // written limits for yet
+          compositionSpec: spec.length > 0 ? spec : null,
+        }),
+      });
+      const result = await res.json();
+      if (result.success) {
+        setSpecAlloy(null);
+        await loadAlloys();
+        setAlloyNotice(
+          spec.length > 0
+            ? `${result.data.name}: ${spec.length} element limit${spec.length === 1 ? "" : "s"} saved. Heats of this alloy are measured against them.`
+            : `${result.data.name}: limits cleared. Its assays are recorded without being judged.`
+        );
+      } else {
+        setAlloyError(result.error || "Failed to save the limits");
+      }
+    } catch {
+      setAlloyError("Failed to save the limits");
+    } finally {
+      setAlloyBusy(false);
+    }
+  };
+
   const handleAddFurnace = async () => {
     if (!newFurnaceName.trim()) {
       setFurnaceError("Enter a furnace name");
@@ -1074,6 +1341,353 @@ export default function SettingsPage() {
       setFurnaceBusy(false);
     }
   };
+
+  const renderAlloysTab = () => (
+    <div className="space-y-6">
+      <div>
+        <h3 className="mb-1 text-lg font-semibold text-[var(--foreground)]">
+          Aluminium Types
+        </h3>
+        <p className="text-sm text-[var(--muted-foreground)]">
+          The alloys this foundry runs. Each one holds four stock lines - ingot,
+          runner &amp; raiser, spillage and rejected parts - and can be charged
+          into a heat or declared as what a heat comes out as.
+        </p>
+      </div>
+
+      {alloyError && <Banner tone="error">{alloyError}</Banner>}
+      {alloyNotice && <Banner tone="notice">{alloyNotice}</Banner>}
+
+      {/* Add */}
+      <div className="rounded-lg border border-[var(--border)] p-4">
+        <div className="grid gap-3 md:grid-cols-3">
+          <Input
+            label="Alloy name"
+            placeholder="e.g. LM10"
+            value={newAlloy.name}
+            onChange={(e) => setNewAlloy({ ...newAlloy, name: e.target.value })}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void handleAddAlloy();
+            }}
+            helperText="Letters, digits and hyphens - stored in capitals"
+          />
+          <Input
+            label="Specification (optional)"
+            placeholder="e.g. AlSi12 - general casting alloy"
+            value={newAlloy.description}
+            onChange={(e) =>
+              setNewAlloy({ ...newAlloy, description: e.target.value })
+            }
+          />
+          <Select
+            label="Bought as ingot?"
+            options={[
+              { value: "yes", label: "Yes - appears on purchase orders" },
+              { value: "no", label: "No - only comes out of the furnace" },
+            ]}
+            value={newAlloy.canBePurchased ? "yes" : "no"}
+            onChange={(value) =>
+              setNewAlloy({ ...newAlloy, canBePurchased: value === "yes" })
+            }
+          />
+        </div>
+        <div className="mt-3 flex justify-end">
+          <Button onClick={handleAddAlloy} disabled={alloyBusy}>
+            <Plus className="mr-2 h-4 w-4" />
+            Add Alloy
+          </Button>
+        </div>
+      </div>
+
+      {/* List */}
+      {alloysLoading ? (
+        <div className="flex justify-center py-8">
+          <Loader2 className="h-6 w-6 animate-spin text-[var(--primary)]" />
+        </div>
+      ) : alloys.length === 0 ? (
+        <div className="py-8 text-center text-[var(--muted-foreground)]">
+          No alloys yet. Add one above.
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {alloys.map((alloy) => (
+            <div
+              key={alloy.id}
+              className="flex flex-wrap items-center gap-3 rounded-lg border border-[var(--border)] p-3"
+            >
+              <div className="rounded-lg bg-[var(--accent)] p-2">
+                <Layers className="h-4 w-4 text-[var(--primary)]" />
+              </div>
+
+              {editingAlloyId === alloy.id ? (
+                <div className="flex flex-1 flex-wrap items-center gap-2">
+                  <Input
+                    value={editingAlloy.name}
+                    onChange={(e) =>
+                      setEditingAlloy({ ...editingAlloy, name: e.target.value })
+                    }
+                    className="w-32"
+                    autoFocus
+                  />
+                  <Input
+                    value={editingAlloy.description}
+                    placeholder="Specification"
+                    onChange={(e) =>
+                      setEditingAlloy({
+                        ...editingAlloy,
+                        description: e.target.value,
+                      })
+                    }
+                    className="flex-1"
+                  />
+                </div>
+              ) : (
+                <div className="flex-1">
+                  <span className="font-medium">{alloy.name}</span>
+                  {alloy.description && (
+                    <span className="ml-2 text-sm text-[var(--muted-foreground)]">
+                      {alloy.description}
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {!alloy.canBePurchased && (
+                <Badge variant="outline">Not bought in</Badge>
+              )}
+              <Badge variant={alloy.isActive ? "success" : "default"}>
+                {alloy.isActive ? "Active" : "Retired"}
+              </Badge>
+
+              <div className="flex items-center gap-1">
+                {editingAlloyId === alloy.id ? (
+                  <>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      title="Save"
+                      disabled={alloyBusy}
+                      onClick={() =>
+                        handleUpdateAlloy(alloy.id, {
+                          name: editingAlloy.name,
+                          description: editingAlloy.description,
+                        })
+                      }
+                    >
+                      <Check className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      title="Cancel"
+                      onClick={() => setEditingAlloyId(null)}
+                    >
+                      <X className="h-4 w-4" />
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      title="Edit"
+                      onClick={() => {
+                        setEditingAlloyId(alloy.id);
+                        setEditingAlloy({
+                          name: alloy.name,
+                          description: alloy.description ?? "",
+                        });
+                      }}
+                    >
+                      <Edit2 className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      title="Composition limits"
+                      onClick={() => openSpecEditor(alloy)}
+                    >
+                      <Wrench className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      title={
+                        alloy.canBePurchased
+                          ? "Stop offering this on purchase orders"
+                          : "Offer this on purchase orders"
+                      }
+                      disabled={alloyBusy}
+                      onClick={() =>
+                        handleUpdateAlloy(alloy.id, {
+                          canBePurchased: !alloy.canBePurchased,
+                        })
+                      }
+                    >
+                      <Database className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      title={alloy.isActive ? "Retire" : "Bring back"}
+                      disabled={alloyBusy}
+                      onClick={() =>
+                        handleUpdateAlloy(alloy.id, { isActive: !alloy.isActive })
+                      }
+                    >
+                      {alloy.isActive ? (
+                        <EyeOff className="h-4 w-4" />
+                      ) : (
+                        <Eye className="h-4 w-4" />
+                      )}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      title="Remove"
+                      disabled={alloyBusy}
+                      onClick={() => handleDeleteAlloy(alloy.id)}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Composition limits for one alloy */}
+      <Modal
+        isOpen={specAlloy !== null}
+        onClose={() => setSpecAlloy(null)}
+        title={specAlloy ? `${specAlloy.name} - composition limits` : "Limits"}
+        description="What a heat of this alloy is measured against on the assay. Leave a limit blank where the spec does not set one."
+        size="lg"
+      >
+        <div className="space-y-3">
+          {specRows.map((row, index) => (
+            <div key={row.key} className="grid grid-cols-12 items-end gap-2">
+              <div className="col-span-3">
+                <Input
+                  label={index === 0 ? "Element" : undefined}
+                  placeholder="Si"
+                  value={row.symbol}
+                  onChange={(e) =>
+                    setSpecRows(
+                      specRows.map((r) =>
+                        r.key === row.key ? { ...r, symbol: e.target.value } : r
+                      )
+                    )
+                  }
+                />
+              </div>
+              <div className="col-span-4">
+                <Input
+                  label={index === 0 ? "Name" : undefined}
+                  placeholder="Silicon"
+                  value={row.name}
+                  onChange={(e) =>
+                    setSpecRows(
+                      specRows.map((r) =>
+                        r.key === row.key ? { ...r, name: e.target.value } : r
+                      )
+                    )
+                  }
+                />
+              </div>
+              <div className="col-span-2">
+                <Input
+                  label={index === 0 ? "Min %" : undefined}
+                  type="number"
+                  placeholder="-"
+                  value={row.min}
+                  onChange={(e) =>
+                    setSpecRows(
+                      specRows.map((r) =>
+                        r.key === row.key ? { ...r, min: e.target.value } : r
+                      )
+                    )
+                  }
+                />
+              </div>
+              <div className="col-span-2">
+                <Input
+                  label={index === 0 ? "Max %" : undefined}
+                  type="number"
+                  placeholder="-"
+                  value={row.max}
+                  onChange={(e) =>
+                    setSpecRows(
+                      specRows.map((r) =>
+                        r.key === row.key ? { ...r, max: e.target.value } : r
+                      )
+                    )
+                  }
+                />
+              </div>
+              <div className="col-span-1 flex justify-end">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  title="Remove this element"
+                  onClick={() =>
+                    setSpecRows(specRows.filter((r) => r.key !== row.key))
+                  }
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+          ))}
+
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() =>
+              setSpecRows([
+                ...specRows,
+                {
+                  key: `spec-${Date.now()}`,
+                  symbol: "",
+                  name: "",
+                  min: "",
+                  max: "",
+                },
+              ])
+            }
+          >
+            <Plus className="mr-1.5 h-4 w-4" />
+            Add element
+          </Button>
+
+          <p className="text-xs text-[var(--muted-foreground)]">
+            With no limits entered, a heat of this alloy is measured against the
+            LM6 grid, which is what every batch used to be judged by. Enter the
+            alloy&apos;s own limits and they are used instead.
+          </p>
+
+          <div className="flex justify-end gap-3 pt-2">
+            <Button variant="secondary" onClick={() => setSpecAlloy(null)}>
+              Cancel
+            </Button>
+            <Button onClick={handleSaveSpec} disabled={alloyBusy}>
+              <Save className="mr-2 h-4 w-4" />
+              Save limits
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      <p className="text-xs text-[var(--muted-foreground)]">
+        An alloy that has stock or appears on a batch or a part cannot be
+        deleted - removing it would take that history with it. It is retired
+        instead: everything recorded against it still reads, and it stops
+        being offered on new entries.
+      </p>
+    </div>
+  );
 
   const renderFurnacesTab = () => (
     <div className="space-y-6">
@@ -1471,6 +2085,8 @@ export default function SettingsPage() {
         return renderSystemTab();
       case "furnaces":
         return renderFurnacesTab();
+      case "alloys":
+        return renderAlloysTab();
       case "activities":
         return renderActivitiesTab();
       case "users":

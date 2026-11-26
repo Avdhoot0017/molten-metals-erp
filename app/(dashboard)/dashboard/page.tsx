@@ -21,7 +21,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { formatWeight, formatCurrency, formatDate } from "@/lib/utils";
-import { materialLabel, type IngotSlice } from "@/lib/ingot";
+import { materialLabel, type GradeSlice } from "@/lib/ingot";
 import { PartDemand } from "@/components/dashboard/part-demand";
 import type { AluminumType } from "@/types";
 
@@ -29,9 +29,9 @@ interface DashboardData {
   inventory: {
     ingot: number;
     /** LM6 / LM9 / LM25, always all three even when a grade is at zero. */
-    ingotByGrade: IngotSlice[];
+    ingotByGrade: GradeSlice[];
     /** The same three grades, summed across every scrap form. */
-    scrapByGrade: IngotSlice[];
+    scrapByGrade: GradeSlice[];
     runnerRaiser: number;
     spillage: number;
     rejectedPart: number;
@@ -43,7 +43,7 @@ interface DashboardData {
       parts: number;
       batches: number;
       aluminumUsed: number;
-      aluminumByGrade: IngotSlice[];
+      aluminumByGrade: GradeSlice[];
       scrapGenerated: number;
     };
     month: {
@@ -51,7 +51,7 @@ interface DashboardData {
       rejectedParts: number;
       batches: number;
       aluminumUsed: number;
-      aluminumByGrade: IngotSlice[];
+      aluminumByGrade: GradeSlice[];
       scrapGenerated: number;
       avgEfficiency: number;
     };
@@ -331,11 +331,10 @@ export default function DashboardPage() {
                 title={grade.label}
                 value={formatWeight(grade.quantity)}
                 icon={Package}
-                iconClassName={grade.iconClass}
                 description={
                   grade.quantity > 0
-                    ? `${grade.percentage.toFixed(1)}% of ingot · ${grade.description}`
-                    : `No stock · ${grade.description}`
+                    ? `${grade.percentage.toFixed(1)}% of ingot${grade.description ? ` · ${grade.description}` : ""}`
+                    : `No stock${grade.description ? ` · ${grade.description}` : ""}`
                 }
               />
             ))}
@@ -369,11 +368,14 @@ export default function DashboardPage() {
             </span>
             {data.inventory.scrapByGrade.map((grade) => (
               <span
-                key={grade.grade}
+                key={grade.id}
                 className="inline-flex items-center gap-2 rounded-full border border-[var(--border)] bg-[var(--card)] px-3 py-1 text-xs"
               >
-                <span className={`h-2 w-2 rounded-full ${grade.dotClass}`} />
-                <span className="font-medium">{grade.grade}</span>
+                <span
+                  className="h-2 w-2 rounded-full"
+                  style={{ backgroundColor: grade.hex }}
+                />
+                <span className="font-medium">{grade.name}</span>
                 <span className="text-[var(--muted-foreground)]">
                   {formatWeight(grade.quantity)}
                 </span>
@@ -740,7 +742,10 @@ export default function DashboardPage() {
                 ...data.inventory.ingotByGrade.map((grade) => ({
                   label: grade.label,
                   value: grade.quantity,
-                  color: grade.dotClass,
+                  // A colour, not a class: a grade the admin added has no
+                  // Tailwind class for Tailwind to have generated
+                  hex: grade.hex,
+                  color: "",
                 })),
                 {
                   label: "Runner & Raiser",
@@ -767,6 +772,9 @@ export default function DashboardPage() {
                     <div
                       className={`h-full ${item.color} rounded-full transition-all duration-500`}
                       style={{
+                        ...("hex" in item && item.hex
+                          ? { backgroundColor: item.hex }
+                          : {}),
                         width: totalAluminum > 0 ? `${(item.value / totalAluminum) * 100}%` : "0%",
                       }}
                     />

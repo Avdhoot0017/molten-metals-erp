@@ -19,7 +19,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { StatCard } from "@/components/ui/stat-card";
 import { formatWeight, formatCurrency } from "@/lib/utils";
 import { weightForExport } from "@/lib/units";
-import type { IngotSlice } from "@/lib/ingot";
+import type { GradeSlice } from "@/lib/ingot";
 import {
   exportToExcel,
   timestampedFilename,
@@ -46,9 +46,9 @@ interface AnalyticsData {
   productionByPart: Array<{ part: string; quantity: number; percentage: number }>;
   scrapBreakdown: Array<{ type: string; quantity: number; percentage: number; color: string }>;
   /** Ingot charged over the period, split LM6 / LM9 / LM25. */
-  ingotBreakdown: IngotSlice[];
+  ingotBreakdown: GradeSlice[];
   /** Ingot currently in stock, split the same way. */
-  ingotStockByGrade: IngotSlice[];
+  ingotStockByGrade: GradeSlice[];
   inventoryTrend: Array<{ date: string; ingot: number; scrap: number }>;
   topClients: Array<{ name: string; dispatched: number; orders: number }>;
 }
@@ -127,12 +127,12 @@ export default function AnalyticsPage() {
             },
           ],
         }),
-        sheet<IngotSlice>({
+        sheet<GradeSlice>({
           name: "Ingot by Grade",
           rows: data.ingotBreakdown,
           columns: [
-            { header: "Grade", value: (r) => r.grade, width: 12 },
-            { header: "Alloy", value: (r) => r.description, width: 30 },
+            { header: "Grade", value: (r) => r.name, width: 12 },
+            { header: "Alloy", value: (r) => r.description ?? "", width: 30 },
             { header: "Charged (kg)", value: (r) => weightForExport(r.quantity), width: 16 },
             {
               header: "Share of Charge (%)",
@@ -380,8 +380,11 @@ export default function AnalyticsPage() {
                     className="flex items-center justify-between text-sm"
                   >
                     <div className="flex items-center gap-2">
-                      <div className={`w-3 h-3 rounded ${grade.dotClass}`} />
-                      <span>{grade.grade}</span>
+                      <div
+                        className="w-3 h-3 rounded"
+                        style={{ backgroundColor: grade.hex }}
+                      />
+                      <span>{grade.name}</span>
                       <span className="text-xs text-[var(--muted-foreground)]">
                         {grade.description}
                       </span>
@@ -498,8 +501,11 @@ export default function AnalyticsPage() {
                           className="flex items-center justify-between text-sm"
                         >
                           <div className="flex items-center gap-2">
-                            <div className={`w-3 h-3 rounded ${item.dotClass}`} />
-                            <span>{item.grade}</span>
+                            <div
+                              className="w-3 h-3 rounded"
+                              style={{ backgroundColor: item.hex }}
+                            />
+                            <span>{item.name}</span>
                             <span className="text-xs text-[var(--muted-foreground)]">
                               {item.percentage.toFixed(1)}%
                             </span>

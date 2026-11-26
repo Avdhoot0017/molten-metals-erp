@@ -53,10 +53,14 @@ import {
   aluminiumBalance,
   checkElementValue,
   LM6_ELEMENTS,
+  elementsForSpec,
+  specStatus,
+  type AlloyElement,
 } from "@/lib/composition";
 import {
-  INGOT_GRADES,
-  SCRAP_FORMS,
+  MATERIAL_FORMS,
+  formSpec,
+  gradeDotStyle,
   gradeName,
   materialType,
   type MaterialForm,
@@ -101,14 +105,26 @@ const MODAL_COPY: Record<
   },
 };
 
-const SCRAP_USED_FIELD: Record<
-  Exclude<MaterialForm, "INGOT">,
-  "runnerRaiserScrapUsed" | "spillageScrapUsed" | "rejectedPartScrapUsed"
-> = {
-  RUNNER_RAISER: "runnerRaiserScrapUsed",
-  SPILLAGE: "spillageScrapUsed",
-  REJECTED_PART: "rejectedPartScrapUsed",
-};
+/**
+ * One line of the charge as it is being typed.
+ *
+ * Weight stays a string until it is sent, like every other weight on this
+ * screen: a half-typed "1." has to survive, and kg are converted to grams at
+ * the boundary.
+ */
+interface ChargeLineDraft {
+  key: string;
+  gradeId: string;
+  form: MaterialForm;
+  weight: string;
+}
+
+let chargeLineCounter = 0;
+
+function newChargeLine(gradeId = "", form: MaterialForm = "INGOT"): ChargeLineDraft {
+  chargeLineCounter += 1;
+  return { key: `charge-${chargeLineCounter}`, gradeId, form, weight: "" };
+}
 import type { AluminumType } from "@/types";
 import {
   MAX_OPEN_BATCHES_PER_FURNACE,
@@ -124,7 +140,7 @@ import {
   weightToInput,
   WEIGHT_UNIT,
 } from "@/lib/units";
-import { expectedScrapOf } from "@/lib/parts";
+import { useGrades } from "@/lib/use-grades";
 
 /**
  * How much metal one casting of this part takes out of the furnace.
@@ -174,17 +190,12 @@ interface PartLine {
  * batches allowed free-form keys), so anything unrecognised is left unjudged
  * rather than flagged.
  */
-function compositionSpecStatus(key: string, value: string): "in" | "out" | "unknown" {
-  const element = LM6_ELEMENTS.find(
-    (e) => e.symbol.toLowerCase() === key.toLowerCase()
-  );
-  if (!element || element.isRemainder) return "unknown";
-
-  const num = Number(value.replace("%", "").trim());
-  if (!Number.isFinite(num)) return "unknown";
-  if (element.min !== undefined && num < element.min) return "out";
-  if (element.max !== undefined && num > element.max) return "out";
-  return "in";
+function compositionSpecStatus(
+  key: string,
+  value: string,
+  elements: AlloyElement[] = LM6_ELEMENTS
+): "in" | "out" | "unknown" {
+  return specStatus(key, value.replace("%", "").trim(), elements);
 }
 
 type ProductionStatus = "PENDING" | "UPDATED" | "COMPLETED";
@@ -236,8 +247,21 @@ interface ProductionRecord {
   densityIndex?: number | null;
   date: string;
   aluminumUsed: number;
-  /** The alloy the heat was run on - also the grade of its scrap. */
+  /**
+   * Legacy name of the heat's alloy, "INGOT_<grade>". Kept in step with
+   * resultGrade below, and still what older rows answer with.
+   */
   ingotGrade: AluminumType;
+  /** The alloy the operator declared this heat comes out as. */
+  resultGrade?: { id: string; name: string; colorHex?: string | null } | null;
+  /** What went in: one line per alloy and form. Heel lines moved no stock. */
+  charges?: Array<{
+    id: string;
+    form: string;
+    weight: number;
+    fromHeel: boolean;
+    grade: { id: string; name: string; colorHex?: string | null };
+  }>;
   aluminumUsedLM6: number;
   aluminumUsedLM9: number;
   aluminumUsedLM25: number;
@@ -313,14 +337,15 @@ export default function ProductionPage() {
     operatorId: "",
     batchNumber: "",
     batchDate: "",
-    // A heat is charged with one alloy, so the grade is picked once and the
-    // weight is entered against it. The API still takes a per-grade split;
-    // the other two grades go over as zero.
-    ingotGrade: "INGOT_LM6" as AluminumType,
-    aluminumUsed: "",
-    runnerRaiserScrapUsed: "",
-    spillageScrapUsed: "",
-    rejectedPartScrapUsed: "",
+    /*
+     * The alloy this heat is declared to come OUT as.
+     *
+     * Not derived from the charge: three grades melted together make a fourth,
+     * and which one is the melter's judgement, not arithmetic. Everything
+     * downstream follows it - the scrap coming off, the metal left in the
+     * furnace, the next heat that claims that metal.
+     */
+    resultGradeId: "",
     densityAtmospheric: "",
     densityVacuum: "",
     runnerRaiserScrap: "",
@@ -332,6 +357,34 @@ export default function ProductionPage() {
 
   // One line per part in the batch, shown as removable chips
   const [partLines, setPartLines] = React.useState<PartLine[]>([]);
+
+  /*
+   * What is going into the furnace: a grade, a form and a weight per line.
+   *
+   * A list rather than one weight per fixed grade, because the shop charges
+   * whatever it has - 10 kg of LM1 ingot, 10 kg of LM2, 5 kg of LM3 spillage.
+   * The metal left in the furnace is not a line here: it is added by the
+   * server from the batch it came from, so nobody can mistype it.
+   */
+  const [chargeLines, setChargeLines] = React.useState<ChargeLineDraft[]>([]);
+  /*
+   * The row being typed, before it is added to the charge.
+   *
+   * Separate from the list so the charge reads as what it is - a short list of
+   * materials - rather than a column of half-filled forms. Adding clears it
+   * for the next one.
+   */
+  const [chargeDraft, setChargeDraft] = React.useState({
+    gradeId: "",
+    form: "INGOT" as MaterialForm,
+    weight: "",
+  });
+  const [chargeDraftError, setChargeDraftError] = React.useState("");
+  const {
+    active: alloyGrades,
+    grades: allAlloyGrades,
+    failed: gradesFailed,
+  } = useGrades();
   const [partToAdd, setPartToAdd] = React.useState("");
 
   // Fixed LM6 element readings, keyed by chemical symbol
@@ -613,18 +666,117 @@ export default function ProductionPage() {
 
   // What is going into the furnace for the batch being entered: fresh ingot
   // plus any scrap re-melted with it.
-  const ingotChargeTotal = parseWeightInput(formData.aluminumUsed);
+  /*
+   * The charge, line by line, with the stock line each one comes out of.
+   * Lines with no grade or no weight are ignored rather than blocking the
+   * save: an empty row is someone who clicked "Add material" and changed
+   * their mind.
+   */
+  const chargeDetail = chargeLines.map((line) => {
+    const grade = alloyGrades.find((g) => g.id === line.gradeId);
+    /*
+     * Two weights, deliberately named apart: `typed` is the kg text as it was
+     * entered, `weight` is the grams it means. Handing the grams back to the
+     * input is what made "1" read as 1000 and left backspace fighting the
+     * field, so the text is the only thing the input ever sees.
+     */
+    const weight = parseWeightInput(line.weight);
+    const stockType = grade ? materialType(line.form, grade.name) : "";
+    const stock = stockType ? (stockByType[stockType] ?? 0) : 0;
+    return {
+      key: line.key,
+      gradeId: line.gradeId,
+      form: line.form,
+      typed: line.weight,
+      grade,
+      weight,
+      stockType,
+      stock,
+      short: stockKnown && grade !== undefined && weight > stock,
+    };
+  });
+  const filledCharge = chargeDetail.filter((l) => l.grade && l.weight > 0);
+
+  /**
+   * Commits the typed row to the charge.
+   *
+   * The same alloy and form twice is one material, not two: the weights are
+   * added together, which is what a second trip to the same stock line means.
+   * Refusals are shown on the row being typed rather than at the top of the
+   * form, where they would be read as something wrong with the batch.
+   */
+  const addChargeDraft = () => {
+    const grade = alloyGrades.find((g) => g.id === chargeDraft.gradeId);
+    if (!grade) {
+      setChargeDraftError("Choose the alloy");
+      return;
+    }
+    const weight = parseWeightInput(chargeDraft.weight);
+    if (weight <= 0) {
+      setChargeDraftError("Enter how much is going in");
+      return;
+    }
+    const existing = chargeLines.find(
+      (l) => l.gradeId === grade.id && l.form === chargeDraft.form
+    );
+    if (existing) {
+      setChargeLines(
+        chargeLines.map((l) =>
+          l === existing
+            ? {
+                ...l,
+                weight: weightToInput(parseWeightInput(l.weight) + weight),
+              }
+            : l
+        )
+      );
+    } else {
+      setChargeLines([
+        ...chargeLines,
+        { ...newChargeLine(grade.id, chargeDraft.form), weight: chargeDraft.weight },
+      ]);
+    }
+    // The alloy and form stay put: charging two forms of the same alloy, or
+    // the same form of several, is the common case
+    setChargeDraft({ ...chargeDraft, weight: "" });
+    setChargeDraftError("");
+  };
+
+  const draftGrade = alloyGrades.find((g) => g.id === chargeDraft.gradeId);
+  const draftStock = draftGrade
+    ? (stockByType[materialType(chargeDraft.form, draftGrade.name)] ?? 0)
+    : 0;
+  /*
+   * What is already on the charge for this line counts against the stock -
+   * two 30 kg lines out of a 40 kg shelf is 20 kg short, and seeing that only
+   * on save would be too late.
+   */
+  const draftAlreadyAdded = draftGrade
+    ? chargeLines
+        .filter((l) => l.gradeId === draftGrade.id && l.form === chargeDraft.form)
+        .reduce((sum, l) => sum + parseWeightInput(l.weight), 0)
+    : 0;
+  const draftShort =
+    stockKnown &&
+    draftGrade !== undefined &&
+    parseWeightInput(chargeDraft.weight) + draftAlreadyAdded > draftStock;
+  const ingotChargeTotal = filledCharge.reduce((sum, l) => sum + l.weight, 0);
+  /** The alloy this heat is declared to come out as. */
+  const resultGrade = alloyGrades.find((g) => g.id === formData.resultGradeId);
+  /*
+   * The element limits the assay is measured against: this alloy's own, where
+   * the admin has entered them. A grade with no spec falls back to the LM6
+   * grid, which is what every heat used to be judged by.
+   */
+  const specElements = elementsForSpec(resultGrade?.compositionSpec);
+
   // Al is auto-filled from the balance, so it does not count as a reading
-  const enteredElementCount = LM6_ELEMENTS.filter(
+  const enteredElementCount = specElements.filter(
     (e) => e.symbol !== "Al" && (elementValues[e.symbol] ?? "").trim() !== ""
   ).length;
-  const selectedGrade =
-    INGOT_GRADES.find((g) => g.type === formData.ingotGrade) ?? INGOT_GRADES[0];
-  const selectedGradeStock = stockByType[formData.ingotGrade] ?? 0;
-  const scrapUsedTotal =
-    parseWeightInput(formData.runnerRaiserScrapUsed) +
-    parseWeightInput(formData.spillageScrapUsed) +
-    parseWeightInput(formData.rejectedPartScrapUsed);
+  const scrapUsedTotal = filledCharge
+    .filter((l) => l.form !== "INGOT")
+    .reduce((sum, l) => sum + l.weight, 0);
 
   /*
    * Metal left in the chosen furnace by its last heat.
@@ -634,10 +786,15 @@ export default function ProductionPage() {
    * because an LM6 heel in an LM9 heat contaminates it. Anything else would be
    * a choice the server is going to refuse.
    */
-  const usableHeels = heels.filter(
-    (h) =>
-      h.furnaceId === formData.furnaceId && h.ingotGrade === formData.ingotGrade
-  );
+  /*
+   * Metal left in the chosen furnace by its last heat.
+   *
+   * Same furnace only - molten metal does not move on its own. The alloy no
+   * longer has to match: that metal is simply another input, and the operator
+   * declares what the mixture comes out as. An LM10 heel charged with fresh
+   * LM6 may well be declared LM11.
+   */
+  const usableHeels = heels.filter((h) => h.furnaceId === formData.furnaceId);
   // Carrying the leftover is compulsory - molten metal already in the furnace
   // cannot be left behind. So when a usable heel exists the charge always
   // includes one: the operator's explicit pick, or the first usable heel by
@@ -654,16 +811,15 @@ export default function ProductionPage() {
   const resetForm = () => {
     setCarriedFromId(null);
     setManualScrap(new Set());
+    setChargeLines([]);
+    setChargeDraft({ gradeId: "", form: "INGOT", weight: "" });
+    setChargeDraftError("");
     setFormData({
       furnaceId: "",
       operatorId: "",
       batchNumber: "",
       batchDate: "",
-      ingotGrade: "INGOT_LM6" as AluminumType,
-      aluminumUsed: "",
-      runnerRaiserScrapUsed: "",
-      spillageScrapUsed: "",
-      rejectedPartScrapUsed: "",
+      resultGradeId: "",
       densityAtmospheric: "",
       densityVacuum: "",
       runnerRaiserScrap: "",
@@ -988,29 +1144,21 @@ export default function ProductionPage() {
     // be is empty.
     if (totalCharge <= 0) {
       setError(
-        `Enter the ${selectedGrade.grade} ingot or scrap charged into this heat, or carry over the metal left in the furnace`
+        "Enter the metal charged into this heat, or carry over what is left in the furnace"
       );
       return;
     }
-    if (stockKnown && ingotChargeTotal > selectedGradeStock) {
-      setError(
-        `Only ${formatWeight(selectedGradeStock)} of ${selectedGrade.grade} in stock`
-      );
+    if (!formData.resultGradeId) {
+      setError("Choose the alloy this heat comes out as");
       return;
     }
-    for (const form of SCRAP_FORMS) {
-      const raw = formData[SCRAP_USED_FIELD[form.form]].trim();
-      if (!raw) continue;
-      const num = Number(raw);
-      if (!Number.isFinite(num) || num < 0) {
-        setError(`${form.label} scrap used must be a weight of 0 or more`);
-        return;
-      }
-      const stock =
-        stockByType[materialType(form.form, selectedGrade.grade)] ?? 0;
-      if (stockKnown && parseWeightInput(raw) > stock) {
+    // Each line against its own stock line: they are different metal, and a
+    // single total would hide which one is short
+    for (const line of chargeDetail) {
+      if (!line.grade || line.weight <= 0) continue;
+      if (line.short) {
         setError(
-          `Only ${formatWeight(stock)} of ${selectedGrade.grade} ${form.label.toLowerCase()} scrap in stock`
+          `Only ${formatWeight(line.stock)} of ${line.grade.name} ${formSpec(line.form).label.toLowerCase()} in stock`
         );
         return;
       }
@@ -1033,19 +1181,16 @@ export default function ProductionPage() {
       // Resolved (not the raw state) so the compulsory default heel is carried
       // even when the operator never explicitly picked one.
       carriedFromId: chosenHeel?.id ?? null,
-      // Sent explicitly: with no ingot at all there is nothing for the server
-      // to infer the alloy from
-      ingotGrade: formData.ingotGrade,
-      // The batch is charged with one grade; the other two go over as 0
-      aluminumUsedLM6:
-        formData.ingotGrade === "INGOT_LM6" ? ingotChargeTotal : 0,
-      aluminumUsedLM9:
-        formData.ingotGrade === "INGOT_LM9" ? ingotChargeTotal : 0,
-      aluminumUsedLM25:
-        formData.ingotGrade === "INGOT_LM25" ? ingotChargeTotal : 0,
-      runnerRaiserScrapUsed: parseWeightInput(formData.runnerRaiserScrapUsed),
-      spillageScrapUsed: parseWeightInput(formData.spillageScrapUsed),
-      rejectedPartScrapUsed: parseWeightInput(formData.rejectedPartScrapUsed),
+      /*
+       * Declared, not derived: the operator says what this mixture comes out
+       * as, and the server books the scrap and the leftover metal to it.
+       */
+      resultGradeId: formData.resultGradeId,
+      charges: filledCharge.map((line) => ({
+        gradeId: line.gradeId,
+        form: line.form,
+        weight: line.weight,
+      })),
     });
   };
 
@@ -1053,7 +1198,7 @@ export default function ProductionPage() {
   const handleRecordMelt = async () => {
     if (!editingRecord) return;
 
-    for (const element of LM6_ELEMENTS) {
+    for (const element of specElements) {
       const { error: elementError } = checkElementValue(
         element,
         elementValues[element.symbol] ?? ""
@@ -1281,16 +1426,28 @@ export default function ProductionPage() {
     // through the same boundary it came in by
     const kg = (grams: number) => (grams ? weightToInput(grams) : "");
 
+    /*
+     * The charge comes back as lines. The heel line is left out: it is not
+     * editable here, and the server rebuilds it from the batch it came from.
+     */
+    if (wantsCharge) {
+      const lines = (record.charges ?? []).filter((c) => !c.fromHeel);
+      setChargeLines(
+        lines.length > 0
+          ? lines.map((line) => ({
+              ...newChargeLine(line.grade.id, line.form as MaterialForm),
+              weight: kg(line.weight),
+            }))
+          : []
+      );
+    }
+
     setFormData((f) => ({
       ...f,
       ...(wantsCharge
         ? {
             furnaceId: record.furnace?.id ?? "",
-            ingotGrade: record.ingotGrade,
-            aluminumUsed: kg(record.aluminumUsed),
-            runnerRaiserScrapUsed: kg(record.runnerRaiserScrapUsed),
-            spillageScrapUsed: kg(record.spillageScrapUsed),
-            rejectedPartScrapUsed: kg(record.rejectedPartScrapUsed),
+            resultGradeId: record.resultGrade?.id ?? "",
           }
         : {}),
       ...(wantsMelt
@@ -1373,7 +1530,7 @@ export default function ProductionPage() {
       setError("Enter the ingot or the scrap charged into this heat");
       return;
     }
-    for (const element of LM6_ELEMENTS) {
+    for (const element of specElements) {
       const { error: elementError } = checkElementValue(
         element,
         elementValues[element.symbol] ?? ""
@@ -1387,16 +1544,12 @@ export default function ProductionPage() {
     await submitBatch(`/api/production/${editingRecord.id}`, "PATCH", {
       stage: "amend",
       furnaceId: formData.furnaceId,
-      ingotGrade: formData.ingotGrade,
-      aluminumUsedLM6:
-        formData.ingotGrade === "INGOT_LM6" ? ingotChargeTotal : 0,
-      aluminumUsedLM9:
-        formData.ingotGrade === "INGOT_LM9" ? ingotChargeTotal : 0,
-      aluminumUsedLM25:
-        formData.ingotGrade === "INGOT_LM25" ? ingotChargeTotal : 0,
-      runnerRaiserScrapUsed: parseWeightInput(formData.runnerRaiserScrapUsed),
-      spillageScrapUsed: parseWeightInput(formData.spillageScrapUsed),
-      rejectedPartScrapUsed: parseWeightInput(formData.rejectedPartScrapUsed),
+      resultGradeId: formData.resultGradeId,
+      charges: filledCharge.map((line) => ({
+        gradeId: line.gradeId,
+        form: line.form,
+        weight: line.weight,
+      })),
       densityAtmospheric: formData.densityAtmospheric || undefined,
       densityVacuum: formData.densityVacuum || undefined,
       composition: buildCompositionEntries(elementValues, elementGrams),
@@ -2138,156 +2291,272 @@ export default function ProductionPage() {
             )}
           </div>
 
-          {/* Aluminium charged. One heat runs on one alloy, so the grade is a
-              single choice and the weight is entered against it. */}
+          {/*
+            * What goes into the furnace, line by line.
+            *
+            * A heat is charged with whatever the shop has: fresh ingot of one
+            * alloy, re-melted scrap of another, and the metal the last heat
+            * left behind. Each line moves its own stock, which is why the
+            * grade and the form are chosen per line rather than once for the
+            * batch.
+            */}
           <div>
-            <h4 className="mb-1 flex items-center gap-2 font-medium text-[var(--foreground)]">
-              <Package className="h-4 w-4 text-[var(--primary)]" />
-              Aluminium Used ({WEIGHT_UNIT})
-            </h4>
+            <div className="mb-1 flex items-center justify-between gap-3">
+              <h4 className="flex items-center gap-2 font-medium text-[var(--foreground)]">
+                <Package className="h-4 w-4 text-[var(--primary)]" />
+                Charged into the furnace
+              </h4>
+              {ingotChargeTotal > 0 && (
+                <span className="text-sm font-medium text-[var(--foreground)]">
+                  {formatWeight(ingotChargeTotal)} added
+                </span>
+              )}
+            </div>
             <p className="mb-3 text-sm text-[var(--muted-foreground)]">
-              Pick the grade this heat was charged with, then enter what went
-              in. Fresh ingot, re-melted scrap, or both &mdash; at least one.
+              Pick an alloy and how much of it is going in, then add it. Add as
+              many as the heat is charged with &mdash; each one comes out of
+              that alloy&apos;s own stock.
             </p>
 
-            {/* Grade tabs - one at a time */}
-            <div
-              role="tablist"
-              aria-label="Aluminium grade"
-              className="mb-4 inline-flex gap-1 rounded-lg bg-[var(--muted)] p-1"
-            >
-              {INGOT_GRADES.map((ingot) => {
-                const active = formData.ingotGrade === ingot.type;
-                return (
-                  <button
-                    key={ingot.type}
-                    type="button"
-                    role="tab"
-                    aria-selected={active}
-                    onClick={() =>
-                      // Scrap weights are cleared with the grade: they were
-                      // entered against the old alloy's stock, and silently
-                      // re-pointing them at another grade would move metal the
-                      // operator never chose.
-                      setFormData({
-                        ...formData,
-                        ingotGrade: ingot.type,
-                        runnerRaiserScrapUsed: "",
-                        spillageScrapUsed: "",
-                        rejectedPartScrapUsed: "",
-                      })
+            {gradesFailed && (
+              <p className="mb-3 text-sm text-[var(--error)]">
+                The alloy list could not be read, so nothing can be charged.
+                Reload the page.
+              </p>
+            )}
+
+            {/* The row being typed */}
+            <div className="rounded-lg border border-[var(--border)] bg-[var(--muted)]/30 p-3">
+              {/*
+                * Tops aligned, not bottoms.
+                *
+                * The weight box grows a line when it has a stock hint or an
+                * error under it; aligning on the bottom dragged the button
+                * down with it every time one appeared. The button carries an
+                * empty label of its own so it starts level with the boxes.
+                */}
+              <div className="grid items-start gap-3 md:grid-cols-[minmax(0,1.3fr)_minmax(0,1.1fr)_minmax(0,1fr)_auto]">
+                <Select
+                  label="Alloy"
+                  placeholder="Choose the alloy"
+                  options={alloyGrades.map((g) => ({
+                    value: g.id,
+                    label: g.name,
+                  }))}
+                  value={chargeDraft.gradeId}
+                  onChange={(value) => {
+                    setChargeDraft({ ...chargeDraft, gradeId: value });
+                    setChargeDraftError("");
+                  }}
+                  className="h-12"
+                />
+                <Select
+                  label="Form"
+                  options={MATERIAL_FORMS.map((f) => ({
+                    value: f.form,
+                    label: f.label,
+                  }))}
+                  value={chargeDraft.form}
+                  onChange={(value) =>
+                    setChargeDraft({
+                      ...chargeDraft,
+                      form: value as MaterialForm,
+                    })
+                  }
+                  className="h-12"
+                />
+                <Input
+                  label={`Weight (${WEIGHT_UNIT})`}
+                  type="number"
+                  min="0"
+                  step="any"
+                  placeholder="e.g. 10"
+                  value={chargeDraft.weight}
+                  error={
+                    draftShort
+                      ? `Only ${formatWeight(draftStock - draftAlreadyAdded)} left in stock`
+                      : undefined
+                  }
+                  helperText={
+                    draftShort || !draftGrade
+                      ? undefined
+                      : stockKnown
+                        ? `${formatWeight(draftStock - draftAlreadyAdded)} available`
+                        : undefined
+                  }
+                  onChange={(e) => {
+                    setChargeDraft({ ...chargeDraft, weight: e.target.value });
+                    setChargeDraftError("");
+                  }}
+                  // Enter adds the material, so a whole charge can be keyed in
+                  // without reaching for the mouse
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      addChargeDraft();
                     }
-                    className={`cursor-pointer rounded-md px-4 py-2 text-sm font-medium transition-colors ${
-                      active
-                        ? "bg-[var(--card)] text-[var(--foreground)] shadow-sm"
-                        : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
-                    }`}
+                  }}
+                  className="h-12"
+                />
+                <div>
+                  <span
+                    aria-hidden="true"
+                    className="mb-1.5 hidden text-sm font-medium md:block"
                   >
-                    <span className="flex items-center gap-2">
-                      <span className={`h-2 w-2 rounded-full ${ingot.dotClass}`} />
-                      {ingot.grade}
-                    </span>
-                  </button>
-                );
-              })}
+                    &nbsp;
+                  </span>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={addChargeDraft}
+                    disabled={draftShort}
+                    className="h-12 w-full md:w-auto md:px-6"
+                  >
+                    <Plus className="mr-1.5 h-4 w-4" />
+                    Add
+                  </Button>
+                </div>
+              </div>
+              {chargeDraftError && (
+                <p className="mt-2 text-sm text-[var(--error)]">
+                  {chargeDraftError}
+                </p>
+              )}
             </div>
 
-            {/* The alloy spec only. The stock figure sits on the input below,
-                where the decision about how much to charge is actually made -
-                saying it twice just competes with itself. */}
-            <p className="mb-3 text-sm text-[var(--muted-foreground)]">
-              {selectedGrade.description}
-              {stockLoadFailed && (
-                <>
-                  {" \u00b7 "}
-                  <span className="text-[var(--error)]">
-                    stock levels unavailable
+            {/*
+              * What has been added, as chips.
+              *
+              * A charge is a short list of materials, so it reads as a list -
+              * one line per material with its weight, removable. Typing rows
+              * of empty form fields made four materials look like a form to
+              * fill in rather than a charge to check.
+              */}
+            {chargeDetail.length === 0 ? (
+              <p className="mt-3 text-sm text-[var(--muted-foreground)]">
+                Nothing charged yet. A heat can run on ingot, on re-melted
+                scrap, or on what the last heat left in the furnace.
+              </p>
+            ) : (
+              <div className="mt-3 flex flex-wrap gap-2">
+                {chargeDetail.map((line) => (
+                  <span
+                    key={line.key}
+                    className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm ${
+                      line.short
+                        ? "border-[var(--error)] bg-[var(--error-light)] text-[var(--error)]"
+                        : "border-[var(--border)] bg-[var(--card)]"
+                    }`}
+                    title={
+                      line.short
+                        ? `Only ${formatWeight(line.stock)} of this is in stock`
+                        : `${formatWeight(line.stock)} in stock`
+                    }
+                  >
+                    <span
+                      className="h-2 w-2 shrink-0 rounded-full"
+                      style={
+                        line.grade
+                          ? gradeDotStyle(
+                              line.grade,
+                              alloyGrades.findIndex((g) => g.id === line.gradeId)
+                            )
+                          : undefined
+                      }
+                    />
+                    <span className="font-medium">{line.grade?.name}</span>
+                    <span className="text-[var(--muted-foreground)]">
+                      {formSpec(line.form).label}
+                    </span>
+                    <span className="font-semibold">
+                      {formatWeight(line.weight)}
+                    </span>
+                    <button
+                      type="button"
+                      title="Remove this material"
+                      onClick={() =>
+                        setChargeLines(
+                          chargeLines.filter((l) => l.key !== line.key)
+                        )
+                      }
+                      className="cursor-pointer rounded-full p-0.5 text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--error)]"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
                   </span>
-                </>
-              )}
-            </p>
+                ))}
+              </div>
+            )}
 
-            <Input
-              label={`Ingot Used (${WEIGHT_UNIT})`}
-              type="number"
-              min="0"
-              step="any"
-              placeholder="Weight in kg"
-              value={formData.aluminumUsed}
-              error={
-                stockKnown && ingotChargeTotal > selectedGradeStock
-                  ? `Only ${formatWeight(selectedGradeStock)} in stock`
-                  : undefined
-              }
-              helperText={
-                // What is available, and - once a weight is typed - what would
-                // be left. The operator is deciding how much to charge, and
-                // that decision is about the remainder, not the total.
-                !stockKnown
-                  ? "Fresh ingot charged into this heat. Optional if scrap is used."
-                  : ingotChargeTotal > selectedGradeStock
-                  ? undefined
-                  : ingotChargeTotal > 0
-                  ? `${formatWeight(selectedGradeStock)} available · ${formatWeight(
-                      selectedGradeStock - ingotChargeTotal
-                    )} left after this heat`
-                  : `${formatWeight(selectedGradeStock)} of ${selectedGrade.grade} available. Optional if scrap is used.`
-              }
-              onChange={(e) =>
-                setFormData({ ...formData, aluminumUsed: e.target.value })
-              }
-              className="h-12"
-            />
+            {/*
+              * And what it comes out as.
+              *
+              * Declared, never calculated: three alloys melted together make a
+              * fourth, and only the melter knows which. The weight beside it
+              * is simply the charge added up - the furnace holds what went
+              * into it.
+              */}
+            <div className="mt-4 rounded-lg border border-[var(--border)] p-4">
+              <h4 className="mb-1 flex items-center gap-2 font-medium text-[var(--foreground)]">
+                <Flame className="h-4 w-4 text-[var(--primary)]" />
+                Resulting alloy
+              </h4>
+              <p className="mb-3 text-sm text-[var(--muted-foreground)]">
+                What this mixture comes out as. The scrap from this batch, and
+                any metal left in the furnace, are booked to it.
+              </p>
+              <div className="grid items-start gap-3 md:grid-cols-2">
+                <Select
+                  label="Comes out as"
+                  placeholder="Choose the alloy"
+                  options={alloyGrades.map((g) => ({
+                    value: g.id,
+                    label: g.name,
+                  }))}
+                  value={formData.resultGradeId}
+                  onChange={(value) =>
+                    setFormData({ ...formData, resultGradeId: value })
+                  }
+                  className="h-12"
+                />
+                <div>
+                  {/* An empty label, so the figure starts level with the
+                      picker's box rather than with its label */}
+                  <span
+                    aria-hidden="true"
+                    className="mb-1.5 hidden text-sm font-medium md:block"
+                  >
+                    &nbsp;
+                  </span>
+                  <div className="flex min-h-12 flex-col justify-center rounded-lg bg-[var(--muted)]/40 px-3 py-2">
+                    {totalCharge > 0 && resultGrade ? (
+                      <>
+                        <span className="text-lg font-semibold leading-tight text-[var(--foreground)]">
+                          {formatWeight(totalCharge)} of {resultGrade.name}
+                        </span>
+                        <span className="text-xs text-[var(--muted-foreground)]">
+                          in the furnace once it is melted
+                        </span>
+                      </>
+                    ) : (
+                      <span className="text-sm text-[var(--muted-foreground)]">
+                        Charge the materials above, then choose what they come
+                        out as.
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
 
-          {/* Scrap charged back into the melt - optional, and restricted to
-              the batch's own alloy. Re-melting LM9 runners into an LM6 heat
-              would put the melt out of spec, so only this grade's scrap is
-              offered and only its stock is shown. */}
+          {/*
+            * Scrap re-melted into this heat is no longer a block of its own:
+            * it is a charge line like any other, with its own alloy, because a
+            * heat may take back scrap of a grade it is not coming out as.
+            * What remains here is the metal already sitting in the furnace.
+            */}
           <div>
-            <h4 className="mb-1 flex items-center gap-2 font-medium text-[var(--foreground)]">
-              <Recycle className="h-4 w-4 text-[var(--primary)]" />
-              Scrap Used ({WEIGHT_UNIT})
-            </h4>
-            <p className="mb-3 text-sm text-[var(--muted-foreground)]">
-              Optional. Scrap re-melted into this batch, from the grade chosen
-              above - a heat can only take back its own alloy. It is deducted
-              from scrap stock and counted as part of the charge.
-            </p>
-            <div className="grid grid-cols-3 gap-4">
-              {SCRAP_FORMS.map((form) => {
-                const field = SCRAP_USED_FIELD[form.form];
-                const stockType = materialType(form.form, selectedGrade.grade);
-                const stock = stockByType[stockType] ?? 0;
-                const entered = parseWeightInput(formData[field]);
-                const short = stockKnown && entered > stock;
-
-                return (
-                  <Input
-                    key={form.form}
-                    label={form.label}
-                    type="number"
-                    min="0"
-                    step="any"
-                    placeholder="Weight in kg"
-                    value={formData[field]}
-                    error={short ? `Only ${formatWeight(stock)} in stock` : undefined}
-                    helperText={
-                      short
-                        ? undefined
-                        : stockKnown
-                          ? `${formatWeight(stock)} in stock`
-                          : undefined
-                    }
-                    onChange={(e) =>
-                      setFormData({ ...formData, [field]: e.target.value })
-                    }
-                    className="h-12"
-                  />
-                );
-              })}
-            </div>
-
             {/* Metal the last heat on this furnace did not pour.
                 Offered only when creating - amending a batch cannot change
                 which heel it was built on without rewriting the batch that
@@ -2431,7 +2700,7 @@ export default function ProductionPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {LM6_ELEMENTS.map((element) => {
+                  {specElements.map((element) => {
                     const raw = elementValues[element.symbol] ?? "";
                     const grams = elementGrams[element.symbol] ?? "";
                     const { error, warning } = element.isRemainder
@@ -2892,9 +3161,10 @@ export default function ProductionPage() {
             ) : batchModal === "create" ? (
               <span className="text-[var(--muted-foreground)]">
                 {totalCharge > 0
-                  ? `Charging ${formatWeight(totalCharge)} of ${selectedGrade.grade}` +
-                    (ingotChargeTotal === 0 ? " - all re-melted scrap" : "")
-                  : "Enter the ingot or scrap charged into the furnace"}
+                  ? `Charging ${formatWeight(totalCharge)}${
+                      resultGrade ? ` as ${resultGrade.name}` : ""
+                    }${scrapUsedTotal === ingotChargeTotal && ingotChargeTotal > 0 ? " - all re-melted scrap" : ""}`
+                  : "Enter the metal charged into the furnace"}
               </span>
             ) : batchModal === "melt" ? (
               <span className="text-[var(--muted-foreground)]">
@@ -2983,20 +3253,36 @@ export default function ProductionPage() {
           // is not worth shouting about - only a material one is called out.
           const impossibleBalance = meltLoss < 0 && Math.abs(meltLoss) > charge * 0.02;
           const hasRemelt = selectedRecord.totalScrapUsed > 0;
-          // Only the grades this heat actually drew on
-          const gradeCharge = [
-            { grade: "LM6", amount: selectedRecord.aluminumUsedLM6 },
-            { grade: "LM9", amount: selectedRecord.aluminumUsedLM9 },
-            { grade: "LM25", amount: selectedRecord.aluminumUsedLM25 },
-          ].filter((g) => g.amount > 0);
+          /*
+           * What this heat was actually charged with, read from its own lines.
+           * The three legacy columns can only name LM6, LM9 and LM25, so a
+           * heat run on anything else would read as empty here.
+           */
+          const gradeCharge = (selectedRecord.charges ?? []).map((line) => ({
+            grade: line.grade.name,
+            form: line.form as MaterialForm,
+            amount: line.weight,
+            fromHeel: line.fromHeel,
+          }));
           const entries = readComposition(selectedRecord.composition);
+          /*
+           * Judged against the alloy this heat came out as, not against LM6.
+           * The grade is looked up in the full list, retired ones included -
+           * an old batch still names the alloy it was.
+           */
+          const detailSpecElements = elementsForSpec(
+            allAlloyGrades.find((g) => g.id === selectedRecord.resultGrade?.id)
+              ?.compositionSpec
+          );
           const outOfSpec = entries.filter(
-            (e) => compositionSpecStatus(e.key, e.value) === "out"
+            (e) => compositionSpecStatus(e.key, e.value, detailSpecElements) === "out"
           ).length;
 
-          // Scrap takes the grade of the heat it came off, so the table names
-          // the alloy rather than leaving the stock line ambiguous
-          const batchGrade = gradeName(selectedRecord.ingotGrade);
+          // Scrap takes the alloy the heat came OUT as, so the table names it
+          // rather than leaving the stock line ambiguous
+          const batchGrade =
+            selectedRecord.resultGrade?.name ??
+            gradeName(selectedRecord.ingotGrade);
           const scrapRows = [
             {
               label: "Runner & Raiser",
@@ -3056,14 +3342,20 @@ export default function ProductionPage() {
                   Metal Balance
                 </h4>
                 <div className="overflow-hidden rounded-lg border border-[var(--border)]">
-                  {gradeCharge.length > 1 ? (
+                  {/*
+                    * One row per material charged, naming its alloy and form.
+                    * A mixed heat is the ordinary case now, so the rows are
+                    * the record rather than a special case of it.
+                    */}
+                  {gradeCharge.length > 0 ? (
                     gradeCharge.map((g) => (
                       <div
-                        key={g.grade}
+                        key={`${g.grade}-${g.form}-${g.fromHeel}`}
                         className="flex items-center justify-between px-4 py-2.5 text-sm"
                       >
                         <span className="text-[var(--muted-foreground)]">
-                          {g.grade} ingot charged
+                          {g.grade} {formSpec(g.form).label.toLowerCase()}
+                          {g.fromHeel ? " carried over" : " charged"}
                         </span>
                         <span className="font-medium">
                           {formatWeight(g.amount)}
@@ -3073,16 +3365,14 @@ export default function ProductionPage() {
                   ) : (
                     <div className="flex items-center justify-between px-4 py-2.5 text-sm">
                       <span className="text-[var(--muted-foreground)]">
-                        {gradeCharge[0]
-                          ? `${gradeCharge[0].grade} ingot charged`
-                          : "Ingot charged"}
+                        Charged
                       </span>
                       <span className="font-medium">
                         {formatWeight(selectedRecord.aluminumUsed)}
                       </span>
                     </div>
                   )}
-                  {hasRemelt && (
+                  {hasRemelt && gradeCharge.length === 0 && (
                     <div className="flex items-center justify-between px-4 py-2.5 text-sm">
                       <span className="text-[var(--muted-foreground)]">
                         Scrap re-melted
@@ -3367,7 +3657,8 @@ export default function ProductionPage() {
                         {entries.map((entry) => {
                           const status = compositionSpecStatus(
                             entry.key,
-                            entry.value
+                            entry.value,
+                            detailSpecElements
                           );
                           return (
                             <div
